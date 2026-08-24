@@ -20,8 +20,15 @@ outside the canonical package or during target installation.
 
 ## Closed-network bootstrap
 
-Mirror the repository through your approved transfer process, then clone it
-from the internal Git service:
+On a connected transfer host, create a bare mirror and record the reviewed
+commit before moving it through your approved transfer process:
+
+```bash
+git clone --mirror https://github.com/OkYongChoi/plugins.git plugins.git
+git --git-dir plugins.git rev-parse refs/heads/main
+```
+
+Then publish the mirror and clone it from the internal Git service:
 
 ```bash
 git clone https://git.example.internal/agents/plugins.git
@@ -159,6 +166,22 @@ python3 -B -m unittest discover -s tests -v
 
 The vendored `repo-summary` source commit and tree digest are fixed in
 `plugins/engineering-starter/VENDORED_SKILLS.json` and checked on every CI run.
+
+### Verified release snapshot
+
+- Public repository: <https://github.com/OkYongChoi/plugins>
+- Verified implementation commit: `a61577aa17f3d76264b7bbafb60bd3e802a542b6`
+- `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
+- Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
+- Vendored `repo-summary` source: `OkYongChoi/skills@559fbe32c4846ba1563af51234f12e3a3614e0ba`
+
+On 2026-08-24, a clean HTTPS clone at the verified commit passed strict
+repository validation and all 23 tests. Pinned remote installation of
+`engineering-starter` used only this repository; the vendored skill bytes
+matched, with no runtime fetch from the Skills repository. Portable installation,
+the bundled Codex validator, and Claude plugin and marketplace validation all
+passed. The corresponding [GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32698747160)
+passed.
 
 Vendored schemas are exact upstream bytes pinned in `UPSTREAM.lock.json`.
 Licensing and modification provenance are in `THIRD_PARTY_NOTICES.md`.
