@@ -873,6 +873,11 @@ def _layout(args: argparse.Namespace, name: str) -> InstallLayout:
     return InstallLayout(parent, parent / name, marketplace, marketplace_root / ".marketplace.install.lock")
 
 
+def _windows_exit_code_is_alive(exit_code: int | None) -> bool:
+    """Treat unknown state as live; Windows reports 259 for a running process."""
+    return exit_code is None or exit_code == 259
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -886,10 +891,17 @@ def _pid_alive(pid: int) -> bool:
             kernel32.OpenProcess.restype = wintypes.HANDLE
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            ]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
             handle = kernel32.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if handle:
                 try:
-                    return True
+                    exit_code = wintypes.DWORD()
+                    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                        return _windows_exit_code_is_alive(None)
+                    return _windows_exit_code_is_alive(exit_code.value)
                 finally:
                     kernel32.CloseHandle(handle)
             # Access denied means the process exists but is protected. Invalid parameter means gone.

@@ -895,6 +895,10 @@ class ToolingTests(unittest.TestCase):
                 creator._run_git(["status"])
 
     def test_cross_platform_pid_liveness_uses_sys_executable(self):
+        self.assertTrue(installer._windows_exit_code_is_alive(259))
+        self.assertTrue(installer._windows_exit_code_is_alive(None))
+        self.assertFalse(installer._windows_exit_code_is_alive(0))
+        self.assertFalse(installer._windows_exit_code_is_alive(1))
         self.assertTrue(installer._pid_alive(os.getpid()))
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
