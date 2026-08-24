@@ -225,18 +225,20 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 ### Validation status
 
 - Public repository: <https://github.com/OkYongChoi/plugins>
+- Verified implementation commit: `3f49f121feaa8643b617c68d548dc1a1858a91bb`
 - `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
 - Vendored `repo-summary` source: `OkYongChoi/skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
 
-On 2026-08-24, the current cross-platform working snapshot passed strict
-repository validation and all 41 tests, with only host-inapplicable capability
-tests skipped on macOS. An offline temporary commit and clean clone with
-`core.autocrlf=true` also passed. The vendored skill bytes match the pinned
+On 2026-08-24, strict repository validation, all 41 tests, and an offline
+`core.autocrlf=true` clean-clone check passed. The corresponding
+[GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32706958783)
+passed on Ubuntu and Windows, including native Windows launchers, hard links,
+junctions, and process-handle checks. The vendored skill bytes match the pinned
 Skills source exactly, with no runtime fetch. Portable installation, the bundled
-Codex validator, and Claude plugin and marketplace validation passed. Record the
-new Plugins release commit and GitHub/GitLab Windows runner results here after
-publishing this snapshot.
+Codex validator, and Claude plugin and marketplace validation passed. Internal
+GitLab runner execution remains an environment-specific acceptance step after
+mirror import.
 
 Vendored schemas are exact upstream bytes pinned in `UPSTREAM.lock.json`.
 Licensing and modification provenance are in `THIRD_PARTY_NOTICES.md`.
