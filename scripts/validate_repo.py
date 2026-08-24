@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ EXPECTED_VENDOR_HASHES = {
     "schemas/1.0.0/mcp.schema.json": "6539175bfcdf43085855183e86da40ea94b166547a72b47ae9a0a390516d3acb",
     "LICENSES/Apache-2.0.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
 }
+EXPECTED_REPO_SUMMARY_COMMIT = "ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f"
 
 
 def _creator():
@@ -41,7 +43,15 @@ def validate() -> list[str]:
         actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
         if actual != expected:
             errors.append(f"vendored hash mismatch: {relative}: {actual}")
-    catalog = json.loads((ROOT / "catalog.json").read_text(encoding="utf-8"))
+    catalog_path = ROOT / "catalog.json"
+    catalog_stat = catalog_path.lstat()
+    if (
+        catalog_path.is_symlink()
+        or getattr(catalog_stat, "st_file_attributes", 0) & 0x400
+        or not stat.S_ISREG(catalog_stat.st_mode)
+    ):
+        return ["catalog.json must be a real regular file, not a symlink or junction"]
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     entries = catalog.get("plugins", [])
     catalog_names = {entry.get("name") for entry in entries}
     directory_names = {path.name for path in (ROOT / "plugins").iterdir() if path.is_dir()}
@@ -50,6 +60,15 @@ def validate() -> list[str]:
     for entry in entries:
         path = ROOT / entry["path"]
         try:
+            expected_path = f"plugins/{entry['name']}"
+            if entry["path"] != expected_path:
+                raise ValueError(f"catalog path must be exactly {expected_path}")
+            current = ROOT
+            for component in entry["path"].split("/"):
+                current = current / component
+                current_stat = current.lstat()
+                if current.is_symlink() or getattr(current_stat, "st_file_attributes", 0) & 0x400:
+                    raise ValueError(f"catalog path contains a symlink or junction: {component}")
             manifest = creator.validate_plugin(path)
             if manifest["name"] != entry["name"]:
                 errors.append(f"manifest mismatch: {entry['name']}")
@@ -63,9 +82,17 @@ def validate() -> list[str]:
     source_commit = provenance["source_commit"]
     if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         errors.append("repo-summary source_commit must be a full SHA")
+    elif source_commit != EXPECTED_REPO_SUMMARY_COMMIT:
+        errors.append(f"repo-summary source_commit must be {EXPECTED_REPO_SUMMARY_COMMIT}")
     actual_skill = creator.tree_digest(ROOT / "plugins/engineering-starter/skills/repo-summary")
     if actual_skill != provenance["tree_sha256"]:
         errors.append(f"repo-summary provenance digest mismatch: {actual_skill}")
+    if provenance.get("source_tree_sha256") != actual_skill:
+        errors.append(f"repo-summary source digest mismatch: {actual_skill}")
+    if provenance.get("vendoring") != "exact build-time snapshot; no runtime fetch":
+        errors.append("repo-summary must be recorded as an exact offline snapshot")
+    if "modifications" in provenance:
+        errors.append("exact repo-summary snapshot must not record local modifications")
     return errors
 
 

@@ -3,7 +3,8 @@
 This repository is the public source for `OkYongChoi/plugins`. It packages
 portable [Agent Plugins 1.0](https://github.com/agentplugins/agent-plugins-spec/blob/ff8ab5e392cc87bd88d87c060815a87490e51003/spec/1.0.0.md)
 without runtime package-manager or GitHub API dependencies. Python scripts use
-only the standard library and Git CLI.
+only the standard library and Git CLI. The supported runtime baseline is
+Python 3.11+ on Linux and Windows.
 
 ## Included plugins
 
@@ -44,6 +45,18 @@ No network is used when `--source` is a local checkout. For ongoing use, set:
 export AGENT_PLUGINS_SOURCE=/srv/approved-mirrors/plugins
 ```
 
+On a Windows runner or workstation (PowerShell):
+
+```powershell
+git clone https://git.example.internal/agents/plugins.git
+Set-Location plugins
+python -B scripts/validate_repo.py
+python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py `
+  install plugin-installer --source $PWD --target portable `
+  --agent-home (Join-Path $HOME ".agents")
+$env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
+```
+
 Source selection is `--source` → `AGENT_PLUGINS_SOURCE` → the checkout that
 contains the running installer → `https://github.com/OkYongChoi/plugins.git`.
 The final remote fallback intentionally fails until a full `--ref` is supplied;
@@ -54,6 +67,11 @@ it never installs from an implicit moving branch.
 ```bash
 ./bin/create-plugin my-plugin --output ./work --adapters codex,claude
 ```
+
+Windows can call `bin\create-plugin.cmd` from cmd.exe,
+`bin\create-plugin.ps1` from PowerShell, or use the policy-independent direct
+form `python -B bin\create-plugin ...`. Equivalent wrappers are provided for
+`plugin-installer`.
 
 This creates `work/my-plugin` as the canonical package and writes projections
 under `work/.staging/codex` and `work/.staging/claude`. The canonical package is
@@ -124,6 +142,30 @@ are checked before the plugin becomes visible and trigger rollback. Vendor
 marketplace read-modify-write operations share one marketplace-wide lock across
 all plugin names.
 
+The portable path profile additionally rejects Windows device names (`CON`,
+`NUL`, `COM1`, and related aliases), reserved characters and alternate data
+stream syntax, trailing dots/spaces, non-NFC names, NFKC/case collisions,
+overlong components, and overlong package-relative paths. Catalog files and
+every catalog path component must be real files/directories; Windows reparse
+points and junctions are treated like symlinks and fail closed.
+
+Locks record host, PID, creation time, and a random ownership token. An old
+lock is recovered only on the same host when its metadata is valid and its PID
+is confirmed dead. Foreign-host or malformed locks are retained for an
+operator to investigate, which avoids stealing a live lock on shared storage.
+Recovery is serialized by an atomic per-lock guard and rechecks directory/file
+identity plus the owner token immediately before a non-replacing quarantine
+rename. A guard left by a crashed recovery attempt fails closed and requires
+operator inspection; it never authorizes deletion of a newer live lock.
+Git subprocesses have a 60-second timeout. Plugin creation uses a private
+staging directory on the output filesystem and rolls back canonical and adapter
+destinations if any publication step fails. An existing `.staging` path must be
+a real, non-reparse directory contained by the selected output root.
+
+`.gitattributes` pins recognized text to LF so catalog and vendored SHA-256
+values remain stable with `core.autocrlf=true`; common binary types are marked
+binary and are never line-ending transformed.
+
 Canonical plugin trees also reject runtime artifacts such as `__pycache__`,
 `.pytest_cache`, `*.pyc`, and `*.pyo`. They are neither ignored nor hashed: their
 presence fails strict validation, catalog digest generation, and installation.
@@ -162,26 +204,39 @@ verification and installation.
 ```bash
 python3 -B scripts/validate_repo.py
 python3 -B -m unittest discover -s tests -v
+python3 -B tests/platform_verify.py --autocrlf true
 ```
+
+Use `python` instead of `python3` on Windows. `platform_verify.py` creates a
+temporary commit from the current tracked and untracked non-ignored working
+snapshot, performs an offline clean clone with the requested `core.autocrlf`
+setting, and reruns strict validation and tests from that clone.
+
+GitHub Actions runs the same checks on `ubuntu-latest` and `windows-latest`.
+For an internal GitLab, `.gitlab-ci.yml` contains separate jobs tagged `linux`
+and `windows`; configure self-managed shell runners with those tags, or rename
+the tags to match the internal runner inventory. The Windows shell executor is
+expected to provide `python` and `git` on `PATH` (PowerShell/pwsh is supported).
+No CI job pulls a language package or container image.
 
 The vendored `repo-summary` source commit and tree digest are fixed in
 `plugins/engineering-starter/VENDORED_SKILLS.json` and checked on every CI run.
 
-### Verified release snapshot
+### Validation status
 
 - Public repository: <https://github.com/OkYongChoi/plugins>
-- Verified implementation commit: `a61577aa17f3d76264b7bbafb60bd3e802a542b6`
 - `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
-- Vendored `repo-summary` source: `OkYongChoi/skills@559fbe32c4846ba1563af51234f12e3a3614e0ba`
+- Vendored `repo-summary` source: `OkYongChoi/skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
 
-On 2026-08-24, a clean HTTPS clone at the verified commit passed strict
-repository validation and all 23 tests. Pinned remote installation of
-`engineering-starter` used only this repository; the vendored skill bytes
-matched, with no runtime fetch from the Skills repository. Portable installation,
-the bundled Codex validator, and Claude plugin and marketplace validation all
-passed. The corresponding [GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32698747160)
-passed.
+On 2026-08-24, the current cross-platform working snapshot passed strict
+repository validation and all 41 tests, with only host-inapplicable capability
+tests skipped on macOS. An offline temporary commit and clean clone with
+`core.autocrlf=true` also passed. The vendored skill bytes match the pinned
+Skills source exactly, with no runtime fetch. Portable installation, the bundled
+Codex validator, and Claude plugin and marketplace validation passed. Record the
+new Plugins release commit and GitHub/GitLab Windows runner results here after
+publishing this snapshot.
 
 Vendored schemas are exact upstream bytes pinned in `UPSTREAM.lock.json`.
 Licensing and modification provenance are in `THIRD_PARTY_NOTICES.md`.

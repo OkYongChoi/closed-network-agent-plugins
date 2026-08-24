@@ -5,10 +5,12 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,6 +34,10 @@ def load(name: str, path: Path):
 
 creator = load("creator", ROOT / "plugins/plugin-creator/skills/plugin-creator/scripts/create_plugin.py")
 installer = load("installer", ROOT / "plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py")
+repo_summary = load(
+    "repo_summary",
+    ROOT / "plugins/engineering-starter/skills/repo-summary/scripts/repo_summary.py",
+)
 
 
 def make_plugin(root: Path, name: str = "boundary-plugin", **extra_manifest):
@@ -43,6 +49,121 @@ def make_plugin(root: Path, name: str = "boundary-plugin", **extra_manifest):
 
 
 class ToolingTests(unittest.TestCase):
+    def test_gitlab_uses_platform_python_commands(self):
+        pipeline = (ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        linux, windows = pipeline.split("validate:windows:", 1)
+        self.assertIn("python3 -B scripts/validate_repo.py", linux)
+        self.assertNotIn("python -B scripts/validate_repo.py", linux)
+        self.assertIn("python -B scripts/validate_repo.py", windows)
+
+    @unittest.skipUnless(os.name == "nt", "Windows launchers require Windows")
+    def test_windows_cmd_and_powershell_entrypoints(self):
+        subprocess.run(
+            ["cmd", "/c", str(ROOT / "bin/plugin-installer.cmd"), "--help"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh is None:
+            self.skipTest("PowerShell is unavailable")
+        subprocess.run(
+            [pwsh, "-NoProfile", "-File", str(ROOT / "bin/create-plugin.ps1"), "--help"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+    def test_repo_summary_detects_windows_and_dotnet_projects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in (
+                "Demo.sln", "Demo.csproj", "Directory.Build.props", "build.gradle", "gradlew.bat",
+                "bootstrap.ps1", "build.cmd", "legacy.bat",
+            ):
+                (root / name).write_text("", encoding="utf-8")
+            data = repo_summary.summarize(root, 100, 1024 * 1024)
+            self.assertTrue({"Demo.sln", "Demo.csproj", "Directory.Build.props", "gradlew.bat"} <= set(data["manifests"]))
+            self.assertTrue({
+                "dotnet build", "dotnet test", ".\\gradlew.bat build", ".\\gradlew.bat test",
+                "pwsh -File ./bootstrap.ps1", ".\\build.cmd", ".\\legacy.bat",
+            } <= set(data["commands"]))
+            self.assertEqual(data["languages"]["PowerShell"], 1)
+            self.assertEqual(data["languages"]["Windows Batch"], 3)
+        self.assertTrue(repo_summary._is_windows_reparse_point(
+            argparse.Namespace(st_file_attributes=repo_summary.FILE_ATTRIBUTE_REPARSE_POINT)
+        ))
+
+    def test_windows_portable_names_and_paths_are_rejected_on_every_host(self):
+        invalid_components = (
+            "CON", "con.txt", "AUX.json", "NUL", "COM1.log", "LPT9",
+            "has:ads", "has*wildcard", "trailing.", "trailing ", "e\u0301",
+            "\uff23\uff2f\uff2e", "\uff0f",
+        )
+        for value in invalid_components:
+            with self.subTest(value=value):
+                with self.assertRaises(creator.PluginError):
+                    creator.validate_portable_component(value)
+                with self.assertRaises(installer.InstallError):
+                    installer.validate_portable_component(value)
+        with self.assertRaises(creator.PluginError):
+            creator.normalize_name("CON")
+
+    def test_zero_link_count_refreshes_and_windows_fallback_is_fail_closed(self):
+        incomplete = argparse.Namespace(st_nlink=0)
+        refreshed = argparse.Namespace(st_nlink=1)
+        path = Path("normal-file")
+        with mock.patch.object(creator.os, "stat", return_value=refreshed):
+            self.assertEqual(creator._file_link_count(path, incomplete), 1)
+        with mock.patch.object(installer.os, "stat", return_value=refreshed):
+            self.assertEqual(installer._file_link_count(path, incomplete), 1)
+
+        still_incomplete = argparse.Namespace(st_nlink=0)
+        with mock.patch.object(creator.os, "stat", return_value=still_incomplete), mock.patch.object(
+            creator, "_windows_file_link_count", return_value=2
+        ) as creator_fallback:
+            self.assertEqual(creator._file_link_count(path, incomplete, platform="nt"), 2)
+            creator_fallback.assert_called_once_with(path)
+        with mock.patch.object(installer.os, "stat", return_value=still_incomplete), mock.patch.object(
+            installer, "_windows_file_link_count", return_value=2
+        ) as installer_fallback:
+            self.assertEqual(installer._file_link_count(path, incomplete, platform="nt"), 2)
+            installer_fallback.assert_called_once_with(path)
+
+    def test_real_hard_links_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_plugin(Path(temp))
+            original = root / "payload.txt"
+            duplicate = root / "payload-copy.txt"
+            original.write_text("payload", encoding="utf-8")
+            try:
+                os.link(original, duplicate)
+            except OSError as exc:
+                self.skipTest(f"hard-link creation is unavailable: {exc}")
+            with self.assertRaisesRegex(creator.PluginError, "hard-linked"):
+                creator.inspect_tree(root)
+            with self.assertRaisesRegex(installer.InstallError, "hard-linked"):
+                installer.inspect_tree(root)
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot create names that this negative test exercises")
+    def test_package_tree_rejects_windows_aliases_unicode_collisions_and_long_paths(self):
+        for relative in ("CON.txt", "payload:ads", "trailing.", "e\u0301"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temp:
+                root = make_plugin(Path(temp))
+                (root / relative).write_text("unsafe", encoding="utf-8")
+                with self.assertRaises(creator.PluginError):
+                    creator.inspect_tree(root)
+                with self.assertRaises(installer.InstallError):
+                    installer.inspect_tree(root)
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_plugin(Path(temp))
+            (root / "1").write_text("one", encoding="utf-8")
+            (root / "\u2460").write_text("two", encoding="utf-8")
+            with self.assertRaises(creator.PluginError):
+                creator.inspect_tree(root)
+            with self.assertRaises(installer.InstallError):
+                installer.inspect_tree(root)
+        with self.assertRaises(creator.PluginError):
+            creator.validate_portable_relative(("x" * 121, "y" * 120))
+        with self.assertRaises(installer.InstallError):
+            installer.validate_portable_relative(("x" * 121, "y" * 120))
+
     def test_creator_builds_canonical_and_isolated_projections(self):
         with tempfile.TemporaryDirectory() as temp:
             args = argparse.Namespace(
@@ -56,6 +177,77 @@ class ToolingTests(unittest.TestCase):
             self.assertFalse((canonical / ".claude-plugin").exists())
             self.assertTrue((Path(temp) / ".staging/codex/plugins/demo-plugin/.codex-plugin/plugin.json").is_file())
             self.assertTrue((Path(temp) / ".staging/claude/plugins/demo-plugin/.claude-plugin/plugin.json").is_file())
+
+    def test_creator_publication_rolls_back_after_adapter_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            args = argparse.Namespace(
+                name="rollback-plugin", output=temp, adapters="codex,claude",
+                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
+                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
+            )
+            actual_replace = creator.os.replace
+            calls = 0
+
+            def fail_second_publish(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("simulated adapter publication failure")
+                return actual_replace(source, destination)
+
+            with mock.patch.object(creator.os, "replace", side_effect=fail_second_publish):
+                with self.assertRaises(creator.PluginError):
+                    creator.create_plugin(args)
+            self.assertFalse((output / "rollback-plugin").exists())
+            self.assertFalse((output / ".staging/codex").exists())
+            self.assertFalse((output / ".staging/claude").exists())
+            self.assertFalse(any(path.name.startswith(".rollback-plugin.create-") for path in output.iterdir()))
+
+    def test_creator_rejects_symlinked_projection_staging_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            output = base / "output"
+            outside = base / "outside"
+            output.mkdir()
+            outside.mkdir()
+            try:
+                (output / ".staging").symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlink creation is unavailable: {exc}")
+            args = argparse.Namespace(
+                name="safe-plugin", output=str(output), adapters="codex",
+                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
+                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
+            )
+            with self.assertRaises(creator.PluginError):
+                creator.create_plugin(args)
+            self.assertFalse((output / "safe-plugin").exists())
+            self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "junction semantics require Windows")
+    def test_creator_rejects_junctioned_projection_staging_root_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            output = base / "output"
+            outside = base / "outside"
+            output.mkdir()
+            outside.mkdir()
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(output / ".staging"), str(outside)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"junction creation is unavailable: {result.stdout.strip()}")
+            args = argparse.Namespace(
+                name="safe-plugin", output=str(output), adapters="codex",
+                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
+                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
+            )
+            with self.assertRaises(creator.PluginError):
+                creator.create_plugin(args)
+            self.assertFalse((output / "safe-plugin").exists())
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_creator_rejects_invalid_frontmatter_and_mcp(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -359,6 +551,66 @@ class ToolingTests(unittest.TestCase):
             with self.assertRaises(installer.InstallError):
                 installer.read_catalog(root)
 
+    def test_catalog_file_and_path_component_links_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            external = root / "external.json"
+            external.write_text(json.dumps({"format_version": 1, "plugins": []}), encoding="utf-8")
+            try:
+                (root / "catalog.json").symlink_to(external)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+            with self.assertRaises(installer.InstallError):
+                installer.read_catalog(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            outside = root / "outside"
+            outside.mkdir()
+            plugin = make_plugin(outside, "linked-plugin")
+            digest = installer.tree_digest(plugin)
+            try:
+                (root / "plugins").symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlink creation is unavailable: {exc}")
+            (root / "catalog.json").write_text(json.dumps({
+                "format_version": 1,
+                "plugins": [{
+                    "name": "linked-plugin", "path": "plugins/linked-plugin",
+                    "content_sha256": digest,
+                }],
+            }), encoding="utf-8")
+            summary = repo_summary.summarize(root, 100, 1024 * 1024)
+            self.assertIn("link/reparse directory: plugins", summary["risks"])
+            with self.assertRaises(installer.InstallError):
+                installer.read_catalog(root)
+
+    @unittest.skipUnless(os.name == "nt", "junction semantics require Windows")
+    def test_catalog_junction_is_rejected_on_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            outside = root / "outside"
+            outside.mkdir()
+            plugin = make_plugin(outside, "junction-plugin")
+            link = root / "plugins"
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"junction creation is unavailable: {result.stdout.strip()}")
+            (root / "catalog.json").write_text(json.dumps({
+                "format_version": 1,
+                "plugins": [{
+                    "name": "junction-plugin", "path": "plugins/junction-plugin",
+                    "content_sha256": installer.tree_digest(plugin),
+                }],
+            }), encoding="utf-8")
+            summary = repo_summary.summarize(root, 100, 1024 * 1024)
+            self.assertIn("link/reparse directory: plugins", summary["risks"])
+            with self.assertRaises(installer.InstallError):
+                installer.read_catalog(root)
+
     def test_runtime_artifacts_fail_closed_and_clean_digest_is_stable(self):
         with tempfile.TemporaryDirectory() as temp:
             root = make_plugin(Path(temp))
@@ -466,6 +718,191 @@ class ToolingTests(unittest.TestCase):
                 args = argparse.Namespace(dest=str(parent), agent_home=None, scope="user", target="portable")
                 with self.assertRaises(installer.InstallError):
                     installer.install(plugin_root, manifest, args)
+
+    def test_stale_lock_recovers_but_old_live_lock_does_not(self):
+        entries = installer.read_catalog(ROOT)
+        entry = installer.select_entry(entries, "engineering-starter")
+        with installer.verify_entry(ROOT, entry) as (plugin_root, loaded):
+            with tempfile.TemporaryDirectory() as temp:
+                parent = Path(temp) / "plugins"
+                parent.mkdir()
+                lock = parent / ".engineering-starter.install.lock"
+                lock.mkdir()
+                old = time.time() - installer.LOCK_STALE_SECONDS - 10
+                (lock / "owner.json").write_text(json.dumps({
+                    "format_version": 1,
+                    "pid": 2_147_483_647,
+                    "host": socket.gethostname(),
+                    "created": old,
+                    "token": "dead",
+                }), encoding="utf-8")
+                args = argparse.Namespace(dest=str(parent), agent_home=None, scope="user", target="portable")
+                destination = installer.install(plugin_root, loaded, args)
+                self.assertTrue(destination.is_dir())
+                self.assertFalse(lock.exists())
+
+            with tempfile.TemporaryDirectory() as temp:
+                parent = Path(temp) / "plugins"
+                parent.mkdir()
+                lock = parent / ".engineering-starter.install.lock"
+                lock.mkdir()
+                (lock / "owner.json").write_text(json.dumps({
+                    "format_version": 1,
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "created": time.time() - installer.LOCK_STALE_SECONDS - 10,
+                    "token": "live",
+                }), encoding="utf-8")
+                args = argparse.Namespace(dest=str(parent), agent_home=None, scope="user", target="portable")
+                with self.assertRaises(installer.InstallError):
+                    installer.install(plugin_root, loaded, args)
+
+            for owner in (
+                {"malformed": True},
+                {
+                    "format_version": 1,
+                    "pid": 2_147_483_647,
+                    "host": "another-runner.invalid",
+                    "created": time.time() - installer.LOCK_STALE_SECONDS - 10,
+                    "token": "foreign",
+                },
+            ):
+                with self.subTest(owner=owner), tempfile.TemporaryDirectory() as temp:
+                    parent = Path(temp) / "plugins"
+                    parent.mkdir()
+                    lock = parent / ".engineering-starter.install.lock"
+                    lock.mkdir()
+                    (lock / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+                    args = argparse.Namespace(dest=str(parent), agent_home=None, scope="user", target="portable")
+                    with self.assertRaises(installer.InstallError):
+                        installer.install(plugin_root, loaded, args)
+                    self.assertTrue(lock.exists())
+
+    def test_stale_recovery_guard_prevents_second_contender_stealing_new_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock = Path(temp) / ".plugin.install.lock"
+            lock.mkdir()
+            (lock / "owner.json").write_text(json.dumps({
+                "format_version": 1,
+                "pid": 2_147_483_647,
+                "host": socket.gethostname(),
+                "created": time.time() - installer.LOCK_STALE_SECONDS - 10,
+                "token": "stale-owner",
+            }), encoding="utf-8")
+            entered_rename = threading.Event()
+            allow_rename = threading.Event()
+            original_rename = installer.os.rename
+            outcomes: list[object] = []
+
+            def blocking_rename(source, destination):
+                if Path(source) == lock:
+                    entered_rename.set()
+                    self.assertTrue(allow_rename.wait(5))
+                return original_rename(source, destination)
+
+            def first_recovery():
+                try:
+                    outcomes.append(installer._recover_stale_lock(lock))
+                except Exception as exc:
+                    outcomes.append(exc)
+
+            with mock.patch.object(installer.os, "rename", side_effect=blocking_rename):
+                thread = threading.Thread(target=first_recovery)
+                thread.start()
+                self.assertTrue(entered_rename.wait(5))
+                # The second contender reads the same stale owner but cannot pass the
+                # atomic recovery guard while the first claim is active.
+                self.assertFalse(installer._recover_stale_lock(lock))
+                allow_rename.set()
+                thread.join(5)
+            self.assertEqual(outcomes, [True])
+            self.assertFalse(lock.exists())
+            self.assertFalse(any("recovery-guard" in path.name for path in Path(temp).iterdir()))
+
+            # Simulate the first installer acquiring its new live lock. A contender
+            # must retain it rather than treating it as the stale directory.
+            lock.mkdir()
+            (lock / "owner.json").write_text(json.dumps({
+                "format_version": 1,
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "created": time.time(),
+                "token": "new-live-owner",
+            }), encoding="utf-8")
+            self.assertFalse(installer._recover_stale_lock(lock))
+            self.assertEqual(json.loads((lock / "owner.json").read_text())["token"], "new-live-owner")
+
+    def test_recovery_guard_left_by_crash_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock = Path(temp) / ".plugin.install.lock"
+            lock.mkdir()
+            (lock / "owner.json").write_text(json.dumps({
+                "format_version": 1,
+                "pid": 2_147_483_647,
+                "host": socket.gethostname(),
+                "created": time.time() - installer.LOCK_STALE_SECONDS - 10,
+                "token": "stale-owner",
+            }), encoding="utf-8")
+            guard = lock.with_name(f".{lock.name}.recovery-guard")
+            guard.mkdir()
+            (guard / "owner.json").write_text(json.dumps({"token": "crashed"}), encoding="utf-8")
+            self.assertFalse(installer._recover_stale_lock(lock))
+            self.assertTrue(lock.exists())
+            self.assertTrue(guard.exists())
+
+    def test_stale_recovery_rechecks_identity_and_owner_token(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock = Path(temp) / ".plugin.install.lock"
+            lock.mkdir()
+            (lock / "owner.json").write_text(json.dumps({
+                "format_version": 1,
+                "pid": 2_147_483_647,
+                "host": socket.gethostname(),
+                "created": time.time() - installer.LOCK_STALE_SECONDS - 10,
+                "token": "stale-owner",
+            }), encoding="utf-8")
+            actual_acquire = installer._acquire_recovery_guard
+
+            def replace_owner_after_claim(path):
+                claim = actual_acquire(path)
+                (path / "owner.json").write_text(json.dumps({
+                    "format_version": 1,
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "created": time.time(),
+                    "token": "replacement-owner",
+                }), encoding="utf-8")
+                return claim
+
+            with mock.patch.object(
+                installer, "_acquire_recovery_guard", side_effect=replace_owner_after_claim
+            ):
+                self.assertFalse(installer._recover_stale_lock(lock))
+            self.assertTrue(lock.exists())
+            self.assertEqual(
+                json.loads((lock / "owner.json").read_text())["token"],
+                "replacement-owner",
+            )
+
+    def test_git_timeouts_fail_closed(self):
+        timeout = subprocess.TimeoutExpired(["git", "fetch"], installer.GIT_TIMEOUT_SECONDS)
+        with mock.patch.object(installer.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(installer.InstallError):
+                installer.run_git(["status"])
+        timeout = subprocess.TimeoutExpired(["git", "fetch"], creator.GIT_TIMEOUT_SECONDS)
+        with mock.patch.object(creator.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(creator.PluginError):
+                creator._run_git(["status"])
+
+    def test_cross_platform_pid_liveness_uses_sys_executable(self):
+        self.assertTrue(installer._pid_alive(os.getpid()))
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(installer._pid_alive(process.pid))
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+        self.assertFalse(installer._pid_alive(process.pid))
 
     def test_source_precedence(self):
         with mock.patch.dict(os.environ, {"AGENT_PLUGINS_SOURCE": "/internal/mirror"}):

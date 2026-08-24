@@ -14,9 +14,11 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -29,6 +31,9 @@ FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 MAX_FILES = 2_000
 MAX_BYTES = 50 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 60
+MAX_PORTABLE_COMPONENT_UNITS = 255
+MAX_PORTABLE_RELATIVE_UNITS = 240
 RUNTIME_ARTIFACT_DIRS = {"__pycache__", ".pytest_cache"}
 RUNTIME_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
 HTTP_FIELD_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -37,10 +42,168 @@ SENSITIVE_HEADER_NAMES = {
     "x-api-key", "api-key",
 }
 SENSITIVE_ENV_RE = re.compile(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)$", re.I)
+WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul", "clock$",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+WINDOWS_FORBIDDEN_CHARS = frozenset('<>:"/\\|?*')
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class PluginError(RuntimeError):
     """Expected validation or creation failure."""
+
+
+def _portable_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def validate_portable_component(value: str, *, label: str = "path component") -> None:
+    """Apply the Windows-compatible subset used for all portable packages."""
+    if not value or value in {".", ".."}:
+        raise PluginError(f"invalid {label}: {value!r}")
+    if value != unicodedata.normalize("NFC", value):
+        raise PluginError(f"{label} is not Unicode NFC-normalized: {value!r}")
+    compatibility = unicodedata.normalize("NFKC", value)
+    if value[-1] in {".", " "} or compatibility[-1] in {".", " "}:
+        raise PluginError(f"{label} ends with a dot or space: {value!r}")
+    if any(
+        ord(char) < 32 or char in WINDOWS_FORBIDDEN_CHARS
+        for char in (*value, *compatibility)
+    ):
+        raise PluginError(f"{label} contains a Windows-reserved character: {value!r}")
+    if compatibility.split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES:
+        raise PluginError(f"{label} is a Windows device name: {value!r}")
+    if _utf16_units(value) > MAX_PORTABLE_COMPONENT_UNITS or len(value.encode("utf-8")) > 255:
+        raise PluginError(f"{label} is too long for a portable filesystem: {value!r}")
+
+
+def validate_portable_relative(parts: tuple[str, ...], *, label: str = "relative path") -> None:
+    for part in parts:
+        validate_portable_component(part, label=label)
+    rendered = "/".join(parts)
+    if _utf16_units(rendered) > MAX_PORTABLE_RELATIVE_UNITS:
+        raise PluginError(
+            f"{label} exceeds the {MAX_PORTABLE_RELATIVE_UNITS}-unit portable limit: {rendered!r}"
+        )
+
+
+def _is_reparse(stat_result: os.stat_result) -> bool:
+    return bool(getattr(stat_result, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _windows_file_link_count(path: Path) -> int:
+    """Read the hard-link count from an opened Windows file handle."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation),
+        )
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        share_all = 0x00000001 | 0x00000002 | 0x00000004
+        handle = create_file(str(path), 0, share_all, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        try:
+            information = ByHandleFileInformation()
+            if not get_information(handle, ctypes.byref(information)):
+                raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
+            if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                raise PluginError(f"cannot count links through a reparse point: {path}")
+            count = int(information.nNumberOfLinks)
+            if count < 1:
+                raise OSError("Windows returned an invalid hard-link count")
+            return count
+        finally:
+            close_handle(handle)
+    except PluginError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise PluginError(f"cannot determine hard-link count safely: {path}") from exc
+
+
+def _file_link_count(path: Path, file_stat: object, *, platform: str | None = None) -> int:
+    initial = getattr(file_stat, "st_nlink", 0)
+    if isinstance(initial, int) and initial > 0:
+        return initial
+    try:
+        refreshed = os.stat(path, follow_symlinks=False)
+    except OSError:
+        refreshed = None
+    refreshed_count = getattr(refreshed, "st_nlink", 0)
+    if isinstance(refreshed_count, int) and refreshed_count > 0:
+        return refreshed_count
+    if (platform or os.name) == "nt":
+        return _windows_file_link_count(path)
+    raise PluginError(f"cannot determine hard-link count safely: {path}")
+
+
+def _collect_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise PluginError(f"cannot inspect source root {root}: {exc}") from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink() or _is_reparse(root_stat):
+        raise PluginError(f"expected a real directory: {root}")
+    collected: list[tuple[Path, str, os.stat_result]] = []
+    stack: list[tuple[Path, tuple[str, ...]]] = [(root, ())]
+    while stack:
+        directory, parent_parts = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            raise PluginError(f"cannot inspect directory {directory}: {exc}") from exc
+        child_directories: list[tuple[Path, tuple[str, ...]]] = []
+        for entry in entries:
+            parts = (*parent_parts, entry.name)
+            validate_portable_relative(parts)
+            relative = "/".join(parts)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise PluginError(f"cannot inspect {relative}: {exc}") from exc
+            if entry.is_symlink() or _is_reparse(entry_stat):
+                raise PluginError(f"symlinks and junctions are not allowed: {relative}")
+            collected.append((Path(entry.path), relative, entry_stat))
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_directories.append((Path(entry.path), parts))
+            elif not stat.S_ISREG(entry_stat.st_mode):
+                raise PluginError(f"unsupported filesystem entry: {relative}")
+        stack.extend(reversed(child_directories))
+    return collected
 
 
 def normalize_name(value: str) -> str:
@@ -48,6 +211,7 @@ def normalize_name(value: str) -> str:
     name = re.sub(r"-{2,}", "-", name).strip("-.")
     if not NAME_RE.fullmatch(name) or len(name) > 64:
         raise PluginError(f"invalid plugin name after normalization: {name!r}")
+    validate_portable_component(name, label="plugin name")
     return name
 
 
@@ -65,39 +229,26 @@ def _write_json(path: Path, value: Any) -> None:
 
 def inspect_tree(root: Path, *, max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES) -> None:
     """Reject unsafe or unexpectedly large source trees before copying."""
-    if not root.is_dir() or root.is_symlink():
-        raise PluginError(f"expected a real directory: {root}")
-    resolved_root = root.resolve(strict=True)
     seen: dict[str, str] = {}
     file_count = 0
     total_bytes = 0
-    for item in sorted(root.rglob("*")):
-        relative = item.relative_to(root)
+    for item, relative, item_stat in _collect_tree(root):
+        relative_path = Path(relative)
         if (
-            any(part in RUNTIME_ARTIFACT_DIRS for part in relative.parts)
+            any(part in RUNTIME_ARTIFACT_DIRS for part in relative_path.parts)
             or item.suffix.lower() in RUNTIME_ARTIFACT_SUFFIXES
         ):
             raise PluginError(f"runtime artifacts are forbidden in canonical packages: {relative}")
-        key = relative.as_posix().casefold()
-        if key in seen and seen[key] != relative.as_posix():
-            raise PluginError(f"case-colliding paths: {seen[key]!r} and {relative.as_posix()!r}")
-        seen[key] = relative.as_posix()
-        if item.is_symlink():
-            raise PluginError(f"symlinks are not allowed: {relative}")
-        try:
-            resolved = item.resolve(strict=True)
-            resolved.relative_to(resolved_root)
-        except (OSError, ValueError) as exc:
-            raise PluginError(f"path escapes source root: {relative}") from exc
-        if item.is_dir():
+        key = "/".join(_portable_key(part) for part in relative_path.parts)
+        if key in seen and seen[key] != relative:
+            raise PluginError(f"portable path collision: {seen[key]!r} and {relative!r}")
+        seen[key] = relative
+        if stat.S_ISDIR(item_stat.st_mode):
             continue
-        if not item.is_file():
-            raise PluginError(f"unsupported filesystem entry: {relative}")
-        stat = item.stat(follow_symlinks=False)
-        if stat.st_nlink > 1:
+        if _file_link_count(item, item_stat) > 1:
             raise PluginError(f"hard-linked files are not allowed: {relative}")
         file_count += 1
-        total_bytes += stat.st_size
+        total_bytes += item_stat.st_size
         if file_count > max_files or total_bytes > max_bytes:
             raise PluginError("source tree exceeds safety limits")
 
@@ -105,8 +256,9 @@ def inspect_tree(root: Path, *, max_files: int = MAX_FILES, max_bytes: int = MAX
 def tree_digest(root: Path) -> str:
     inspect_tree(root)
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
+    files = [(path, relative) for path, relative, info in _collect_tree(root) if stat.S_ISREG(info.st_mode)]
+    for path, relative_text in sorted(files, key=lambda item: item[1]):
+        relative = relative_text.encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         data = path.read_bytes()
@@ -161,6 +313,7 @@ def validate_skill(skill_root: Path) -> str:
     description = metadata.get("description", "")
     if not SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
         raise PluginError(f"invalid skill name {name!r} in {skill_root}")
+    validate_portable_component(name, label="skill name")
     if skill_root.name != name:
         raise PluginError(f"skill folder {skill_root.name!r} does not match name {name!r}")
     if not description or len(description) > 1024:
@@ -188,6 +341,7 @@ def validate_plugin(plugin_root: Path) -> dict[str, Any]:
     name = manifest.get("name")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or len(name) > 64:
         raise PluginError(f"invalid plugin name: {name!r}")
+    validate_portable_component(name, label="plugin name")
     if plugin_root.name != name:
         raise PluginError(f"plugin folder {plugin_root.name!r} does not match name {name!r}")
     for field in ("version", "description", "homepage", "repository", "license"):
@@ -327,11 +481,35 @@ def _run_git(args: list[str], cwd: Path | None = None) -> str:
         completed = subprocess.run(
             ["git", *args], cwd=cwd, check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise PluginError(f"git command timed out after {GIT_TIMEOUT_SECONDS} seconds") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise PluginError(f"git command failed: {detail.strip()}") from exc
     return completed.stdout.strip()
+
+
+def _resolve_real_relative(root: Path, value: str, *, label: str) -> Path:
+    if not value or value.startswith("/") or "\\" in value:
+        raise PluginError(f"{label} must use a portable repository-relative path")
+    parts = tuple(value.split("/"))
+    validate_portable_relative(parts, label=label)
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            item_stat = current.lstat()
+        except OSError as exc:
+            raise PluginError(f"cannot inspect {label} component {part!r}: {exc}") from exc
+        if current.is_symlink() or _is_reparse(item_stat):
+            raise PluginError(f"{label} contains a symlink or junction: {value!r}")
+    try:
+        current.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise PluginError(f"{label} escapes source root") from exc
+    return current
 
 
 def _obtain_skill(source: str, ref: str | None, skill_path: str | None, temp: Path) -> tuple[Path, str | None]:
@@ -365,14 +543,10 @@ def _obtain_skill(source: str, ref: str | None, skill_path: str | None, temp: Pa
         if actual_ref.lower() != ref.lower():
             raise PluginError(f"remote resolved to {actual_ref}, expected {ref}")
         root = root.resolve(strict=True)
-    relative = Path(skill_path) if skill_path else Path(".")
-    if relative.is_absolute() or ".." in relative.parts:
-        raise PluginError("--path must be a repository-relative path without '..'")
-    candidate = (root / relative).resolve(strict=True)
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise PluginError("imported skill escapes source root") from exc
+    if not skill_path or skill_path == ".":
+        candidate = root
+    else:
+        candidate = _resolve_real_relative(root, skill_path, label="--path")
     validate_skill(candidate)
     return candidate, actual_ref
 
@@ -510,19 +684,36 @@ def build_projection(canonical: Path, adapter: str, staging_root: Path) -> None:
         raise PluginError(f"unsupported adapter: {adapter}")
 
 
+def _require_real_contained_directory(path: Path, root: Path, *, label: str) -> None:
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        raise PluginError(f"cannot inspect {label}: {path}: {exc}") from exc
+    if path.is_symlink() or _is_reparse(path_stat) or not stat.S_ISDIR(path_stat.st_mode):
+        raise PluginError(f"{label} must be a real non-reparse directory: {path}")
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise PluginError(f"{label} escapes the output directory: {path}") from exc
+
+
 def create_plugin(args: argparse.Namespace) -> Path:
     name = normalize_name(args.name)
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     target = output / name
-    if target.exists():
+    if os.name == "nt" and _utf16_units(str(target)) > MAX_PORTABLE_RELATIVE_UNITS:
+        raise PluginError(f"destination path exceeds the Windows-safe limit: {target}")
+    if os.path.lexists(target):
         raise PluginError(f"destination already exists: {target}")
     adapters = [item.strip() for item in args.adapters.split(",") if item.strip()]
     if len(adapters) != len(set(adapters)) or set(adapters) - {"codex", "claude"}:
         raise PluginError("--adapters accepts a comma-separated subset of codex,claude")
 
-    with tempfile.TemporaryDirectory(prefix="plugin-create-") as tmp_name:
-        tmp = Path(tmp_name)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{name}.create-", dir=output))
+    published: list[Path] = []
+    created_staging_root = False
+    try:
         canonical = tmp / name
         (canonical / "skills").mkdir(parents=True)
         manifest = {
@@ -556,13 +747,48 @@ def create_plugin(args: argparse.Namespace) -> Path:
             build_projection(canonical, adapter, projection_tmp)
         for adapter in adapters:
             destination = output / ".staging" / adapter
-            if destination.exists():
+            if os.path.lexists(destination):
                 raise PluginError(f"projection destination already exists: {destination}")
-        canonical.rename(target)
-        for adapter in adapters:
-            destination = output / ".staging" / adapter
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            (projection_tmp / adapter).rename(destination)
+        staging_root = output / ".staging"
+        if adapters:
+            if os.path.lexists(staging_root):
+                _require_real_contained_directory(
+                    staging_root, output, label="projection staging directory"
+                )
+            else:
+                staging_root.mkdir()
+                created_staging_root = True
+                _require_real_contained_directory(
+                    staging_root, output, label="projection staging directory"
+                )
+        try:
+            os.replace(canonical, target)
+            published.append(target)
+            for adapter in adapters:
+                destination = staging_root / adapter
+                _require_real_contained_directory(
+                    staging_root, output, label="projection staging directory"
+                )
+                if os.path.lexists(destination):
+                    raise PluginError(f"projection destination already exists: {destination}")
+                os.replace(projection_tmp / adapter, destination)
+                published.append(destination)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for destination in reversed(published):
+                try:
+                    shutil.rmtree(destination)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{destination}: {rollback_exc}")
+            if created_staging_root:
+                try:
+                    staging_root.rmdir()
+                except OSError:
+                    pass
+            detail = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
+            raise PluginError(f"failed to publish plugin transaction: {exc}{detail}") from exc
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return target
 
 

@@ -22,7 +22,8 @@ networks. The upstream skill is Apache-2.0 licensed.
 
 ## Vendored repo-summary skill
 
-`plugins/engineering-starter/skills/repo-summary` is a build-time snapshot of
-the example skill from `OkYongChoi/skills`. Its exact source revision and tree
-digest are recorded in `plugins/engineering-starter/VENDORED_SKILLS.json`.
-Installation never contacts the skills repository.
+`plugins/engineering-starter/skills/repo-summary` is an exact build-time
+snapshot of the example skill in `OkYongChoi/skills`, with no local
+modifications. Its source revision and matching source/result tree digests are
+recorded in `plugins/engineering-starter/VENDORED_SKILLS.json`. Installation
+never contacts the skills repository.

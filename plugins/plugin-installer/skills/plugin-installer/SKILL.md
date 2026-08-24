@@ -44,6 +44,14 @@ roots below the current project. A Claude `--dest` must itself be named
 `plugins` and sit directly below the marketplace root. Existing installs are
 never overwritten.
 
+On Windows use `python` instead of `python3`; paths may be native Windows paths:
+
+```powershell
+python scripts/plugin_installer.py install engineering-starter `
+  --source D:\approved-mirrors\plugins --target portable `
+  --agent-home (Join-Path $HOME ".agents")
+```
+
 ## Runtime loading boundaries
 
 The installer follows Agent Plugins 1.0 client-loading recovery rules after
@@ -60,3 +68,13 @@ The installed copy contains only accepted components. Unsafe package entries
 (including symlinks, hard links, path escapes, and case collisions) remain a
 fatal installer policy even when a component-level client could otherwise skip
 them.
+
+The portable path policy also rejects Windows device aliases, ADS/reserved
+characters, trailing dots/spaces, non-NFC names, Unicode-normalized collisions,
+and path-length violations. Junctions and other Windows reparse points are
+rejected. A stale lock is recovered only when it has valid ownership metadata,
+was created on the current host, and its PID is confirmed dead; malformed and
+foreign-host locks fail closed. Recovery uses an atomic guard, identity and
+owner-token rechecks, and a non-replacing quarantine rename. A crash-left guard
+requires operator inspection rather than risking deletion of a newer live lock.
+Git operations time out after 60 seconds.

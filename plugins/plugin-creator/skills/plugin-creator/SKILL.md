@@ -8,6 +8,12 @@ description: Create and validate portable Agent Plugins 1.0 packages, optionally
 Create the canonical package first. Keep vendor-specific files out of that
 package; projections are disposable staging output.
 
+Creation stages canonical and adapter output on the selected output filesystem,
+then publishes it as one rollback-capable transaction. This supports Windows
+drive-letter layouts and Linux mounts without cross-filesystem rename failures.
+Any existing `.staging` path must be a real non-reparse directory that resolves
+inside the output root; symlinked or junction-backed staging roots are rejected.
+
 ## Create a plugin
 
 ```bash
@@ -35,6 +41,10 @@ frontmatter before copying anything. With `--ref`, even a local Git source is
 materialized from that exact commit, so dirty and untracked working-tree files
 cannot enter the package. Without `--ref`, provenance records a local snapshot
 with a null commit rather than claiming the current `HEAD` is authoritative.
+Portable names and paths reject Windows device aliases, ADS/reserved
+characters, trailing dots/spaces, non-NFC names, Unicode-normalized collisions,
+junctions/reparse points, and path-length violations on both Linux and Windows.
+Git operations time out after 60 seconds.
 
 ## Validate
 

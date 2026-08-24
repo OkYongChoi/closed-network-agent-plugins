@@ -1,0 +1,28 @@
+# Catalog digests cover exact bytes. Keep all recognized text deterministic on
+# Linux and Windows even when a client has core.autocrlf=true.
+* text=auto eol=lf
+
+# Repository convenience launchers use native cmd.exe line endings. They are
+# outside catalog-hashed plugin packages.
+/bin/*.cmd text eol=crlf
+
+# Never transform binary payloads that may be included by future plugins.
+*.7z binary
+*.bin binary
+*.dll binary
+*.exe binary
+*.gif binary
+*.gz binary
+*.ico binary
+*.jar binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.pyc binary
+*.pyo binary
+*.tar binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.zip binary

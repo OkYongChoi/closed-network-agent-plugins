@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -22,6 +23,8 @@ MANIFESTS = {
     "pom.xml",
     "build.gradle",
     "build.gradle.kts",
+    "gradlew",
+    "gradlew.bat",
 }
 CREDENTIAL_NAMES = {
     ".env",
@@ -44,14 +47,26 @@ EXTENSIONS = {
     ".kt": "Kotlin",
     ".rb": "Ruby",
     ".sh": "Shell",
+    ".ps1": "PowerShell",
+    ".cmd": "Windows Batch",
+    ".bat": "Windows Batch",
+    ".cs": "C#",
 }
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 10
+FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 
 class SummaryError(RuntimeError):
     pass
+
+
+def _is_windows_reparse_point(file_stat: object) -> bool:
+    """Detect Windows symlinks, junctions, and other reparse points."""
+
+    attributes = getattr(file_stat, "st_file_attributes", 0)
+    return bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _git(
@@ -106,7 +121,12 @@ def _git(
 
 def _package_commands(path: Path) -> list[str]:
     try:
-        if path.is_symlink() or not path.is_file():
+        info = path.lstat()
+        if (
+            _is_windows_reparse_point(info)
+            or path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+        ):
             return []
         with path.open("rb") as handle:
             raw = handle.read(MAX_MANIFEST_BYTES + 1)
@@ -123,6 +143,7 @@ def _package_commands(path: Path) -> list[str]:
 
 def detect_commands(root: Path, manifests: list[str]) -> list[str]:
     commands: list[str] = []
+    manifest_set = set(manifests)
     if "package.json" in manifests:
         commands.extend(_package_commands(root / "package.json"))
     if "pyproject.toml" in manifests:
@@ -135,9 +156,35 @@ def detect_commands(root: Path, manifests: list[str]) -> list[str]:
         commands.append("make (inspect targets first)")
     if "pom.xml" in manifests:
         commands.extend(["mvn package", "mvn test"])
-    if "build.gradle" in manifests or "build.gradle.kts" in manifests:
-        commands.extend(["./gradlew build", "./gradlew test"])
+    if "build.gradle" in manifest_set or "build.gradle.kts" in manifest_set:
+        if "gradlew.bat" in manifest_set:
+            commands.extend([r".\gradlew.bat build", r".\gradlew.bat test"])
+        if "gradlew" in manifest_set:
+            commands.extend(["./gradlew build", "./gradlew test"])
+        if "gradlew" not in manifest_set and "gradlew.bat" not in manifest_set:
+            commands.extend(["gradle build", "gradle test"])
+    if any(
+        Path(name).suffix.lower() in {".sln", ".csproj"}
+        or name.casefold().startswith("directory.build.")
+        for name in manifests
+    ):
+        commands.extend(["dotnet build", "dotnet test"])
+    for name in manifests:
+        suffix = Path(name).suffix.lower()
+        if suffix == ".ps1":
+            commands.append(f"pwsh -File ./{name}")
+        elif suffix in {".cmd", ".bat"} and name != "gradlew.bat":
+            commands.append(f".\\{name}")
     return list(dict.fromkeys(commands))
+
+
+def _is_top_level_manifest(name: str) -> bool:
+    suffix = Path(name).suffix.lower()
+    return (
+        name in MANIFESTS
+        or suffix in {".sln", ".csproj", ".ps1", ".cmd", ".bat"}
+        or name.casefold().startswith("directory.build.")
+    )
 
 
 def summarize(root: Path, max_files: int, max_bytes: int) -> dict[str, object]:
@@ -159,8 +206,13 @@ def summarize(root: Path, max_files: int, max_bytes: int) -> dict[str, object]:
             rel = path.relative_to(root)
             if len(rel.parts) == 1:
                 top_level.add(name + "/")
-            if path.is_symlink():
-                risks.append(f"symlink directory: {rel.as_posix()}")
+            try:
+                directory_info = path.lstat()
+            except OSError:
+                risks.append(f"unreadable directory: {rel.as_posix()}")
+                continue
+            if _is_windows_reparse_point(directory_info) or path.is_symlink():
+                risks.append(f"link/reparse directory: {rel.as_posix()}")
             elif name not in IGNORED_DIRS:
                 kept_dirs.append(name)
         dirnames[:] = kept_dirs
@@ -169,7 +221,7 @@ def summarize(root: Path, max_files: int, max_bytes: int) -> dict[str, object]:
             rel = path.relative_to(root)
             if len(rel.parts) == 1:
                 top_level.add(name)
-                if name in MANIFESTS:
+                if _is_top_level_manifest(name):
                     manifests.add(name)
             files += 1
             if files > max_files:
@@ -180,8 +232,8 @@ def summarize(root: Path, max_files: int, max_bytes: int) -> dict[str, object]:
             except OSError:
                 risks.append(f"unreadable path: {rel.as_posix()}")
                 continue
-            if path.is_symlink():
-                risks.append(f"symlink: {rel.as_posix()}")
+            if _is_windows_reparse_point(info) or path.is_symlink():
+                risks.append(f"link/reparse file: {rel.as_posix()}")
                 continue
             total_bytes += info.st_size
             if total_bytes > max_bytes:

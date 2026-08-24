@@ -10,10 +10,15 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
@@ -29,6 +34,10 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 MAX_FILES = 2_000
 MAX_BYTES = 50 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 60
+LOCK_STALE_SECONDS = 60 * 60
+MAX_PORTABLE_COMPONENT_UNITS = 255
+MAX_PORTABLE_RELATIVE_UNITS = 240
 RUNTIME_ARTIFACT_DIRS = {"__pycache__", ".pytest_cache"}
 RUNTIME_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
 MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
@@ -38,10 +47,167 @@ SENSITIVE_HEADER_NAMES = {
     "x-api-key", "api-key",
 }
 SENSITIVE_ENV_RE = re.compile(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)$", re.I)
+WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul", "clock$",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+WINDOWS_FORBIDDEN_CHARS = frozenset('<>:"/\\|?*')
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class InstallError(RuntimeError):
     """Expected source, validation, or installation failure."""
+
+
+def _portable_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def validate_portable_component(value: str, *, label: str = "path component") -> None:
+    if not value or value in {".", ".."}:
+        raise InstallError(f"invalid {label}: {value!r}")
+    if value != unicodedata.normalize("NFC", value):
+        raise InstallError(f"{label} is not Unicode NFC-normalized: {value!r}")
+    compatibility = unicodedata.normalize("NFKC", value)
+    if value[-1] in {".", " "} or compatibility[-1] in {".", " "}:
+        raise InstallError(f"{label} ends with a dot or space: {value!r}")
+    if any(
+        ord(char) < 32 or char in WINDOWS_FORBIDDEN_CHARS
+        for char in (*value, *compatibility)
+    ):
+        raise InstallError(f"{label} contains a Windows-reserved character: {value!r}")
+    if compatibility.split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES:
+        raise InstallError(f"{label} is a Windows device name: {value!r}")
+    if _utf16_units(value) > MAX_PORTABLE_COMPONENT_UNITS or len(value.encode("utf-8")) > 255:
+        raise InstallError(f"{label} is too long for a portable filesystem: {value!r}")
+
+
+def validate_portable_relative(parts: tuple[str, ...], *, label: str = "relative path") -> None:
+    for part in parts:
+        validate_portable_component(part, label=label)
+    rendered = "/".join(parts)
+    if _utf16_units(rendered) > MAX_PORTABLE_RELATIVE_UNITS:
+        raise InstallError(
+            f"{label} exceeds the {MAX_PORTABLE_RELATIVE_UNITS}-unit portable limit: {rendered!r}"
+        )
+
+
+def _is_reparse(stat_result: os.stat_result) -> bool:
+    return bool(getattr(stat_result, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _windows_file_link_count(path: Path) -> int:
+    """Read the hard-link count from an opened Windows file handle."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation),
+        )
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        share_all = 0x00000001 | 0x00000002 | 0x00000004
+        handle = create_file(str(path), 0, share_all, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        try:
+            information = ByHandleFileInformation()
+            if not get_information(handle, ctypes.byref(information)):
+                raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
+            if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                raise InstallError(f"cannot count links through a reparse point: {path}")
+            count = int(information.nNumberOfLinks)
+            if count < 1:
+                raise OSError("Windows returned an invalid hard-link count")
+            return count
+        finally:
+            close_handle(handle)
+    except InstallError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise InstallError(f"cannot determine hard-link count safely: {path}") from exc
+
+
+def _file_link_count(path: Path, file_stat: object, *, platform: str | None = None) -> int:
+    initial = getattr(file_stat, "st_nlink", 0)
+    if isinstance(initial, int) and initial > 0:
+        return initial
+    try:
+        refreshed = os.stat(path, follow_symlinks=False)
+    except OSError:
+        refreshed = None
+    refreshed_count = getattr(refreshed, "st_nlink", 0)
+    if isinstance(refreshed_count, int) and refreshed_count > 0:
+        return refreshed_count
+    if (platform or os.name) == "nt":
+        return _windows_file_link_count(path)
+    raise InstallError(f"cannot determine hard-link count safely: {path}")
+
+
+def _collect_tree(root: Path) -> list[tuple[Path, str, os.stat_result]]:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise InstallError(f"cannot inspect plugin root {root}: {exc}") from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink() or _is_reparse(root_stat):
+        raise InstallError(f"expected a real plugin directory: {root}")
+    collected: list[tuple[Path, str, os.stat_result]] = []
+    stack: list[tuple[Path, tuple[str, ...]]] = [(root, ())]
+    while stack:
+        directory, parent_parts = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            raise InstallError(f"cannot inspect directory {directory}: {exc}") from exc
+        child_directories: list[tuple[Path, tuple[str, ...]]] = []
+        for entry in entries:
+            parts = (*parent_parts, entry.name)
+            validate_portable_relative(parts)
+            relative = "/".join(parts)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise InstallError(f"cannot inspect {relative}: {exc}") from exc
+            if entry.is_symlink() or _is_reparse(entry_stat):
+                raise InstallError(f"symlinks and junctions are not allowed: {relative}")
+            collected.append((Path(entry.path), relative, entry_stat))
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_directories.append((Path(entry.path), parts))
+            elif not stat.S_ISREG(entry_stat.st_mode):
+                raise InstallError(f"unsupported filesystem entry: {relative}")
+        stack.extend(reversed(child_directories))
+    return collected
 
 
 class LoadedPlugin(NamedTuple):
@@ -77,7 +243,10 @@ def run_git(args: list[str], cwd: Path | None = None) -> str:
         result = subprocess.run(
             ["git", *args], cwd=cwd, check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(f"git command timed out after {GIT_TIMEOUT_SECONDS} seconds") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise InstallError(f"git command failed: {detail.strip()}") from exc
@@ -85,38 +254,26 @@ def run_git(args: list[str], cwd: Path | None = None) -> str:
 
 
 def inspect_tree(root: Path) -> None:
-    if not root.is_dir() or root.is_symlink():
-        raise InstallError(f"expected a real plugin directory: {root}")
-    resolved_root = root.resolve(strict=True)
     seen: dict[str, str] = {}
     files = 0
     size = 0
-    for item in sorted(root.rglob("*")):
-        relative = item.relative_to(root)
+    for item, relative, item_stat in _collect_tree(root):
+        relative_path = Path(relative)
         if (
-            any(part in RUNTIME_ARTIFACT_DIRS for part in relative.parts)
+            any(part in RUNTIME_ARTIFACT_DIRS for part in relative_path.parts)
             or item.suffix.lower() in RUNTIME_ARTIFACT_SUFFIXES
         ):
             raise InstallError(f"runtime artifacts are forbidden in canonical packages: {relative}")
-        key = relative.as_posix().casefold()
-        if key in seen and seen[key] != relative.as_posix():
-            raise InstallError(f"case-colliding paths: {seen[key]!r} and {relative.as_posix()!r}")
-        seen[key] = relative.as_posix()
-        if item.is_symlink():
-            raise InstallError(f"symlinks are not allowed: {relative}")
-        try:
-            item.resolve(strict=True).relative_to(resolved_root)
-        except (OSError, ValueError) as exc:
-            raise InstallError(f"path escapes plugin root: {relative}") from exc
-        if item.is_dir():
+        key = "/".join(_portable_key(part) for part in relative_path.parts)
+        if key in seen and seen[key] != relative:
+            raise InstallError(f"portable path collision: {seen[key]!r} and {relative!r}")
+        seen[key] = relative
+        if stat.S_ISDIR(item_stat.st_mode):
             continue
-        if not item.is_file():
-            raise InstallError(f"unsupported filesystem entry: {relative}")
-        stat = item.stat(follow_symlinks=False)
-        if stat.st_nlink > 1:
+        if _file_link_count(item, item_stat) > 1:
             raise InstallError(f"hard-linked files are not allowed: {relative}")
         files += 1
-        size += stat.st_size
+        size += item_stat.st_size
         if files > MAX_FILES or size > MAX_BYTES:
             raise InstallError("plugin exceeds file-count or byte-size limit")
 
@@ -124,8 +281,9 @@ def inspect_tree(root: Path) -> None:
 def tree_digest(root: Path) -> str:
     inspect_tree(root)
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
+    files = [(path, relative) for path, relative, info in _collect_tree(root) if stat.S_ISREG(info.st_mode)]
+    for path, relative_text in sorted(files, key=lambda item: item[1]):
+        relative = relative_text.encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         data = path.read_bytes()
@@ -153,6 +311,7 @@ def _load_manifest(root: Path, warnings: list[str]) -> dict[str, Any]:
         raise InstallError("unsupported Agent Plugins schema")
     if not isinstance(name, str) or len(name) > 64 or not NAME_RE.fullmatch(name):
         raise InstallError(f"invalid plugin name: {name!r}")
+    validate_portable_component(name, label="plugin name")
     if root.name != name:
         raise InstallError(f"plugin folder {root.name!r} does not match manifest {name!r}")
     for field in ("version", "description", "homepage", "repository", "license"):
@@ -228,6 +387,7 @@ def _load_skills(root: Path, warnings: list[str]) -> tuple[str, ...]:
             name, description = _skill_metadata(skill_md)
             if name != child.name or not SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
                 raise InstallError("frontmatter name does not match the skill directory")
+            validate_portable_component(name, label="skill name")
             if not description or len(description) > 1024:
                 raise InstallError("description must contain 1-1024 characters")
             accepted.append(child.name)
@@ -445,31 +605,61 @@ def materialize_source(source: str, ref: str | None, allow_mutable: bool) -> Ite
         yield root, actual_ref
 
 
+def _real_catalog_path(root: Path, relative: str, name: str) -> Path:
+    if not relative or relative.startswith("/") or "\\" in relative:
+        raise InstallError(f"unsafe catalog path for {name}: {relative!r}")
+    parts = tuple(relative.split("/"))
+    validate_portable_relative(parts, label=f"catalog path for {name}")
+    if len(parts) != 2 or parts[0] != "plugins" or parts[1] != name:
+        raise InstallError(f"catalog path for {name} must be exactly plugins/{name}")
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            item_stat = current.lstat()
+        except OSError as exc:
+            raise InstallError(f"cannot inspect catalog path component for {name}: {part!r}") from exc
+        if current.is_symlink() or _is_reparse(item_stat):
+            raise InstallError(f"catalog path for {name} contains a symlink or junction")
+    try:
+        current.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise InstallError(f"catalog path escapes repository for {name}") from exc
+    return current
+
+
 def read_catalog(root: Path) -> list[dict[str, str]]:
-    data = load_json(root / "catalog.json")
+    catalog_path = root / "catalog.json"
+    try:
+        catalog_stat = catalog_path.lstat()
+    except OSError as exc:
+        raise InstallError(f"cannot inspect catalog.json: {exc}") from exc
+    if catalog_path.is_symlink() or _is_reparse(catalog_stat) or not stat.S_ISREG(catalog_stat.st_mode):
+        raise InstallError("catalog.json must be a real regular file, not a symlink or junction")
+    data = load_json(catalog_path)
     if not isinstance(data, dict) or data.get("format_version") != 1 or not isinstance(data.get("plugins"), list):
         raise InstallError("unsupported catalog format")
     result: list[dict[str, str]] = []
     names: set[str] = set()
-    resolved_root = root.resolve(strict=True)
+    paths: set[str] = set()
     for raw in data["plugins"]:
         if not isinstance(raw, dict) or set(raw) != {"name", "path", "content_sha256"}:
             raise InstallError("each catalog entry must contain name, path, and content_sha256")
         name, relative, digest = raw["name"], raw["path"], raw["content_sha256"]
         if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             raise InstallError(f"invalid catalog plugin name: {name!r}")
-        if name.casefold() in names:
+        validate_portable_component(name, label="catalog plugin name")
+        name_key = _portable_key(name)
+        if name_key in names:
             raise InstallError(f"duplicate catalog plugin name: {name}")
-        names.add(name.casefold())
+        names.add(name_key)
         if not isinstance(relative, str):
             raise InstallError(f"invalid catalog path for {name}")
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts:
-            raise InstallError(f"unsafe catalog path for {name}: {relative!r}")
-        try:
-            (root / path).resolve(strict=True).relative_to(resolved_root)
-        except (OSError, ValueError) as exc:
-            raise InstallError(f"catalog path escapes repository for {name}") from exc
+        path_key = "/".join(_portable_key(part) for part in relative.split("/"))
+        if path_key in paths:
+            raise InstallError(f"portable catalog path collision for {name}: {relative!r}")
+        paths.add(path_key)
+        _real_catalog_path(root, relative, name)
         if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
             raise InstallError(f"invalid content digest for {name}")
         result.append({"name": name, "path": relative, "content_sha256": digest})
@@ -618,7 +808,10 @@ def project_plugin(source: Path, loaded: LoadedPlugin, target: str, output: Path
 
 def marketplace_value(path: Path, target: str, manifest: dict[str, Any]) -> dict[str, Any]:
     name = manifest["name"]
-    if path.exists():
+    if os.path.lexists(path):
+        path_stat = path.lstat()
+        if path.is_symlink() or _is_reparse(path_stat) or not stat.S_ISREG(path_stat.st_mode):
+            raise InstallError(f"marketplace must be a real regular file: {path}")
         value = load_json(path)
         if not isinstance(value, dict) or not isinstance(value.get("plugins"), list):
             raise InstallError(f"invalid existing marketplace: {path}")
@@ -680,51 +873,286 @@ def _layout(args: argparse.Namespace, name: str) -> InstallLayout:
     return InstallLayout(parent, parent / name, marketplace, marketplace_root / ".marketplace.install.lock")
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                try:
+                    return True
+                finally:
+                    kernel32.CloseHandle(handle)
+            # Access denied means the process exists but is protected. Invalid parameter means gone.
+            return ctypes.get_last_error() != 87
+        except (AttributeError, OSError):
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Fields that must remain stable while a lock directory is being claimed."""
+    return (
+        int(getattr(value, "st_dev", 0)),
+        int(getattr(value, "st_ino", 0)),
+        int(getattr(value, "st_nlink", 0)),
+        int(getattr(value, "st_size", 0)),
+        int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
+        int(getattr(value, "st_ctime_ns", int(value.st_ctime * 1_000_000_000))),
+    )
+
+
+def _acquire_recovery_guard(lock: Path) -> tuple[Path, str] | None:
+    guard = lock.with_name(f".{lock.name}.recovery-guard")
+    token = secrets.token_hex(16)
+    try:
+        guard.mkdir()
+    except FileExistsError:
+        return None
+    try:
+        write_json(guard / "owner.json", {"token": token})
+    except Exception:
+        shutil.rmtree(guard, ignore_errors=True)
+        raise
+    return guard, token
+
+
+def _release_recovery_guard(guard: Path, token: str) -> None:
+    """Remove only the guard created by this caller; otherwise fail closed."""
+    try:
+        owner_path = guard / "owner.json"
+        owner_stat = owner_path.lstat()
+        if owner_path.is_symlink() or _is_reparse(owner_stat):
+            return
+        owner = load_json(owner_path)
+        if not isinstance(owner, dict) or owner.get("token") != token:
+            return
+        owner_path.unlink()
+        guard.rmdir()
+    except (InstallError, OSError):
+        pass
+
+
+def _same_lock_snapshot(
+    lock: Path,
+    expected_lock: tuple[int, int, int, int, int, int],
+    expected_owner: tuple[int, int, int, int, int, int],
+    expected_token: str,
+) -> bool:
+    """Recheck identity and ownership immediately before a directory rename."""
+    owner_path = lock / "owner.json"
+    try:
+        lock_before = lock.lstat()
+        owner_before = owner_path.lstat()
+        if (
+            lock.is_symlink()
+            or _is_reparse(lock_before)
+            or not stat.S_ISDIR(lock_before.st_mode)
+            or owner_path.is_symlink()
+            or _is_reparse(owner_before)
+            or not stat.S_ISREG(owner_before.st_mode)
+            or _stat_identity(lock_before) != expected_lock
+            or _stat_identity(owner_before) != expected_owner
+        ):
+            return False
+        owner = load_json(owner_path)
+        lock_after = lock.lstat()
+        owner_after = owner_path.lstat()
+    except (InstallError, OSError):
+        return False
+    return (
+        isinstance(owner, dict)
+        and owner.get("token") == expected_token
+        and _stat_identity(lock_after) == expected_lock
+        and _stat_identity(owner_after) == expected_owner
+    )
+
+
+def _remove_owned_lock(lock: Path, token: str) -> None:
+    """Quarantine and remove only the lock directory still owned by token."""
+    guard_claim = _acquire_recovery_guard(lock)
+    if guard_claim is None:
+        return
+    guard, guard_token = guard_claim
+    try:
+        owner_path = lock / "owner.json"
+        try:
+            lock_stat = lock.lstat()
+            owner_stat = owner_path.lstat()
+        except OSError:
+            return
+        if not _same_lock_snapshot(
+            lock, _stat_identity(lock_stat), _stat_identity(owner_stat), token
+        ):
+            return
+        quarantine = lock.with_name(f".{lock.name}.complete-{secrets.token_hex(8)}")
+        try:
+            os.rename(lock, quarantine)
+        except OSError:
+            return
+        shutil.rmtree(quarantine, ignore_errors=True)
+    finally:
+        _release_recovery_guard(guard, guard_token)
+
+
+def _recover_stale_lock(lock: Path, *, stale_seconds: int = LOCK_STALE_SECONDS) -> bool:
+    try:
+        lock_stat = lock.lstat()
+    except FileNotFoundError:
+        return True
+    if lock.is_symlink() or _is_reparse(lock_stat) or not stat.S_ISDIR(lock_stat.st_mode):
+        raise InstallError(f"install lock is not a real directory: {lock}")
+    owner_path = lock / "owner.json"
+    try:
+        owner_stat = owner_path.lstat()
+        if owner_path.is_symlink() or _is_reparse(owner_stat) or not stat.S_ISREG(owner_stat.st_mode):
+            return False
+        loaded = load_json(owner_path)
+    except (InstallError, OSError):
+        return False
+    required = {"format_version", "pid", "host", "created", "token"}
+    if (
+        not isinstance(loaded, dict)
+        or set(loaded) != required
+        or loaded.get("format_version") != 1
+        or not isinstance(loaded.get("pid"), int)
+        or isinstance(loaded.get("pid"), bool)
+        or loaded["pid"] <= 0
+        or not isinstance(loaded.get("host"), str)
+        or not loaded["host"]
+        or not isinstance(loaded.get("created"), (int, float))
+        or isinstance(loaded.get("created"), bool)
+        or not isinstance(loaded.get("token"), str)
+        or not loaded["token"]
+    ):
+        return False
+    age = max(0.0, time.time() - float(loaded["created"]))
+    if age <= stale_seconds:
+        return False
+    if loaded["host"] != socket.gethostname() or _pid_alive(loaded["pid"]):
+        return False
+    guard_claim = _acquire_recovery_guard(lock)
+    if guard_claim is None:
+        return False
+    guard, guard_token = guard_claim
+    try:
+        if not _same_lock_snapshot(
+            lock,
+            _stat_identity(lock_stat),
+            _stat_identity(owner_stat),
+            loaded["token"],
+        ):
+            return False
+        quarantine = lock.with_name(f".{lock.name}.stale-{secrets.token_hex(8)}")
+        try:
+            # os.rename never replaces an existing non-empty quarantine directory.
+            os.rename(lock, quarantine)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        shutil.rmtree(quarantine, ignore_errors=True)
+        return True
+    finally:
+        _release_recovery_guard(guard, guard_token)
+
+
+@contextmanager
+def install_lock(lock: Path) -> Iterator[None]:
+    token = secrets.token_hex(16)
+    for _ in range(3):
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            if _recover_stale_lock(lock):
+                continue
+            raise InstallError(f"another install is in progress: {lock}")
+        try:
+            write_json(lock / "owner.json", {
+                "format_version": 1,
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "created": time.time(),
+                "token": token,
+            })
+        except Exception:
+            shutil.rmtree(lock, ignore_errors=True)
+            raise
+        try:
+            yield
+        finally:
+            _remove_owned_lock(lock, token)
+        return
+    raise InstallError(f"could not acquire install lock after stale-lock recovery: {lock}")
+
+
 def install(source_plugin: Path, loaded: LoadedPlugin, args: argparse.Namespace) -> Path:
     manifest = loaded.manifest
     layout = _layout(args, manifest["name"])
     parent, destination = layout.plugin_parent, layout.destination
+    if os.name == "nt" and _utf16_units(str(destination)) > MAX_PORTABLE_RELATIVE_UNITS:
+        raise InstallError(f"destination path exceeds the Windows-safe limit: {destination}")
     parent.mkdir(parents=True, exist_ok=True)
     layout.lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = layout.lock_path
-    try:
-        lock.mkdir()
-    except FileExistsError as exc:
-        raise InstallError(f"another install is in progress: {lock}") from exc
     installed = False
     marketplace_tmp: Path | None = None
-    try:
-        if destination.exists():
-            raise InstallError(f"destination already exists: {destination}")
-        temp_root = Path(tempfile.mkdtemp(prefix=f".{manifest['name']}.", dir=parent))
-        staged = temp_root / manifest["name"]
-        project_plugin(source_plugin, loaded, args.target, staged)
-        validate_projection(staged, manifest["name"], args.target)
-        marketplace = layout.marketplace_path
-        marketplace_data = marketplace_value(marketplace, args.target, manifest) if marketplace else None
-        os.replace(staged, destination)
-        installed = True
-        if marketplace and marketplace_data is not None:
-            marketplace_tmp = marketplace.with_name(f".{marketplace.name}.{os.getpid()}.tmp")
-            write_json(marketplace_tmp, marketplace_data)
-            os.replace(marketplace_tmp, marketplace)
-            marketplace_tmp = None
-        shutil.rmtree(temp_root, ignore_errors=True)
-        return destination
-    except Exception:
-        if installed and destination.exists():
-            shutil.rmtree(destination, ignore_errors=True)
-        raise
-    finally:
-        if marketplace_tmp is not None:
-            try:
-                marketplace_tmp.unlink()
-            except FileNotFoundError:
-                pass
+    temp_root: Path | None = None
+    with install_lock(lock):
         try:
-            lock.rmdir()
-        except OSError:
-            pass
+            if os.path.lexists(destination):
+                raise InstallError(f"destination already exists: {destination}")
+            temp_root = Path(tempfile.mkdtemp(prefix=f".{manifest['name']}.", dir=parent))
+            staged = temp_root / manifest["name"]
+            project_plugin(source_plugin, loaded, args.target, staged)
+            validate_projection(staged, manifest["name"], args.target)
+            marketplace = layout.marketplace_path
+            marketplace_data = marketplace_value(marketplace, args.target, manifest) if marketplace else None
+            os.replace(staged, destination)
+            installed = True
+            if marketplace and marketplace_data is not None:
+                marketplace.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{marketplace.name}.", suffix=".tmp", dir=marketplace.parent
+                )
+                marketplace_tmp = Path(temp_name)
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(marketplace_data, handle, indent=2, ensure_ascii=False)
+                    handle.write("\n")
+                os.replace(marketplace_tmp, marketplace)
+                marketplace_tmp = None
+            shutil.rmtree(temp_root, ignore_errors=True)
+            temp_root = None
+            return destination
+        except Exception:
+            if installed and destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+        finally:
+            if marketplace_tmp is not None:
+                try:
+                    marketplace_tmp.unlink()
+                except FileNotFoundError:
+                    pass
+            if temp_root is not None:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def validate_projection(root: Path, name: str, target: str) -> None:
