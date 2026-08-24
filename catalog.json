@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "repository": "https://github.com/OkYongChoi/plugins.git",
+  "plugins": [
+    {
+      "name": "engineering-starter",
+      "path": "plugins/engineering-starter",
+      "content_sha256": "314843dc374d0bba8df139db7ec9e1a95f64147130ceb92995a87e4e4c051319"
+    },
+    {
+      "name": "plugin-creator",
+      "path": "plugins/plugin-creator",
+      "content_sha256": "593b0cf20426c62b8deab5cae900953546369c266a84e06553c96bd9b40444c8"
+    },
+    {
+      "name": "plugin-installer",
+      "path": "plugins/plugin-installer",
+      "content_sha256": "e2e968e826cb657916317525ec77a68d07d2bbd4c3d9bfab235d8274d8eca232"
+    }
+  ]
+}

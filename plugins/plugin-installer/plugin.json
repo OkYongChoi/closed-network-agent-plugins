@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "plugin-installer",
+  "version": "1.0.0",
+  "description": "List and securely install catalogued plugins from local mirrors or pinned Git sources.",
+  "author": {
+    "name": "OkYongChoi",
+    "url": "https://github.com/OkYongChoi"
+  },
+  "homepage": "https://github.com/OkYongChoi/plugins",
+  "repository": "https://github.com/OkYongChoi/plugins",
+  "license": "Apache-2.0",
+  "keywords": ["agent-plugins", "installer", "offline", "supply-chain"]
+}

@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "upstreams": [
+    {
+      "name": "agent-plugins-spec",
+      "repository": "https://github.com/agentplugins/agent-plugins-spec.git",
+      "commit": "ff8ab5e392cc87bd88d87c060815a87490e51003",
+      "license": "Apache-2.0 for schemas; CC-BY-4.0 for specification text",
+      "files": [
+        "schemas/1.0.0/plugin.schema.json",
+        "schemas/1.0.0/mcp.schema.json",
+        "LICENSES/Apache-2.0.txt"
+      ]
+    },
+    {
+      "name": "openai-plugin-creator",
+      "repository": "https://github.com/openai/skills.git",
+      "commit": "e940b8a86138adf03972802b990a1dfc57fcbf09",
+      "path": "skills/.system/plugin-creator",
+      "tree": "7be91ca65d463da971db11034621e735b9dbe633",
+      "license": "Apache-2.0",
+      "use": "design provenance; closed-network implementation rewritten here"
+    }
+  ]
+}

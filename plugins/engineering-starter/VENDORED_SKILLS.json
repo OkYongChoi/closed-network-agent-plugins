@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "skills": [
+    {
+      "name": "repo-summary",
+      "source_repository": "https://github.com/OkYongChoi/skills.git",
+      "source_commit": "559fbe32c4846ba1563af51234f12e3a3614e0ba",
+      "source_path": "skills/repo-summary",
+      "tree_sha256": "dc6e29a301e3f47d37ff05b3d7d049abd83992a9b6fd24cf2897f3aa04dac0c4",
+      "license": "Apache-2.0",
+      "vendoring": "build-time snapshot; no runtime fetch"
+    }
+  ]
+}
