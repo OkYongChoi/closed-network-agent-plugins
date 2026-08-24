@@ -26,8 +26,8 @@ from the internal Git service:
 ```bash
 git clone https://git.example.internal/agents/plugins.git
 cd plugins
-python3 scripts/validate_repo.py
-python3 plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py \
+python3 -B scripts/validate_repo.py
+python3 -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py \
   install plugin-installer --source "$PWD" --target portable --agent-home ~/.agents
 ```
 
@@ -117,6 +117,13 @@ are checked before the plugin becomes visible and trigger rollback. Vendor
 marketplace read-modify-write operations share one marketplace-wide lock across
 all plugin names.
 
+Canonical plugin trees also reject runtime artifacts such as `__pycache__`,
+`.pytest_cache`, `*.pyc`, and `*.pyo`. They are neither ignored nor hashed: their
+presence fails strict validation, catalog digest generation, and installation.
+This keeps the catalog's “every file path and byte” guarantee stable between a
+developer checkout and a clean remote clone. Run Python verification with an
+external bytecode cache or `PYTHONDONTWRITEBYTECODE=1`.
+
 There are deliberately two validation modes. `plugin-creator` and
 `scripts/validate_repo.py` are strict authoring gates: repository content must
 fully conform, so unknown manifest fields or any invalid component fail the
@@ -146,8 +153,8 @@ verification and installation.
 ## Validation
 
 ```bash
-python3 scripts/validate_repo.py
-python3 -m unittest discover -s tests -v
+python3 -B scripts/validate_repo.py
+python3 -B -m unittest discover -s tests -v
 ```
 
 The vendored `repo-summary` source commit and tree digest are fixed in

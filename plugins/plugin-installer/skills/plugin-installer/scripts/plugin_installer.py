@@ -29,6 +29,8 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 MAX_FILES = 2_000
 MAX_BYTES = 50 * 1024 * 1024
+RUNTIME_ARTIFACT_DIRS = {"__pycache__", ".pytest_cache"}
+RUNTIME_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
 MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
 HTTP_FIELD_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 SENSITIVE_HEADER_NAMES = {
@@ -91,6 +93,11 @@ def inspect_tree(root: Path) -> None:
     size = 0
     for item in sorted(root.rglob("*")):
         relative = item.relative_to(root)
+        if (
+            any(part in RUNTIME_ARTIFACT_DIRS for part in relative.parts)
+            or item.suffix.lower() in RUNTIME_ARTIFACT_SUFFIXES
+        ):
+            raise InstallError(f"runtime artifacts are forbidden in canonical packages: {relative}")
         key = relative.as_posix().casefold()
         if key in seen and seen[key] != relative.as_posix():
             raise InstallError(f"case-colliding paths: {seen[key]!r} and {relative.as_posix()!r}")

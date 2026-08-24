@@ -359,6 +359,33 @@ class ToolingTests(unittest.TestCase):
             with self.assertRaises(installer.InstallError):
                 installer.read_catalog(root)
 
+    def test_runtime_artifacts_fail_closed_and_clean_digest_is_stable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_plugin(Path(temp))
+            clean_creator_digest = creator.tree_digest(root)
+            clean_installer_digest = installer.tree_digest(root)
+            self.assertEqual(clean_creator_digest, clean_installer_digest)
+            cache = root / "scripts/__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "generated.cpython-313.pyc").write_bytes(b"runtime-cache")
+            with self.assertRaises(creator.PluginError):
+                creator.tree_digest(root)
+            with self.assertRaises(creator.PluginError):
+                creator.validate_plugin(root)
+            with self.assertRaises(installer.InstallError):
+                installer.tree_digest(root)
+            with self.assertRaises(installer.InstallError):
+                installer.load_plugin(root)
+            shutil.rmtree(cache)
+            (root / "scripts/generated.pyo").write_bytes(b"optimized-cache")
+            with self.assertRaises(creator.PluginError):
+                creator.tree_digest(root)
+            with self.assertRaises(installer.InstallError):
+                installer.tree_digest(root)
+            (root / "scripts/generated.pyo").unlink()
+            self.assertEqual(creator.tree_digest(root), clean_creator_digest)
+            self.assertEqual(installer.tree_digest(root), clean_installer_digest)
+
     def test_digest_mismatch_blocks_install(self):
         catalog = json.loads((ROOT / "catalog.json").read_text())
         entry = next(item for item in catalog["plugins"] if item["name"] == "engineering-starter").copy()

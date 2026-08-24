@@ -29,6 +29,8 @@ FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 MAX_FILES = 2_000
 MAX_BYTES = 50 * 1024 * 1024
+RUNTIME_ARTIFACT_DIRS = {"__pycache__", ".pytest_cache"}
+RUNTIME_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
 HTTP_FIELD_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 SENSITIVE_HEADER_NAMES = {
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -71,6 +73,11 @@ def inspect_tree(root: Path, *, max_files: int = MAX_FILES, max_bytes: int = MAX
     total_bytes = 0
     for item in sorted(root.rglob("*")):
         relative = item.relative_to(root)
+        if (
+            any(part in RUNTIME_ARTIFACT_DIRS for part in relative.parts)
+            or item.suffix.lower() in RUNTIME_ARTIFACT_SUFFIXES
+        ):
+            raise PluginError(f"runtime artifacts are forbidden in canonical packages: {relative}")
         key = relative.as_posix().casefold()
         if key in seen and seen[key] != relative.as_posix():
             raise PluginError(f"case-colliding paths: {seen[key]!r} and {relative.as_posix()!r}")
