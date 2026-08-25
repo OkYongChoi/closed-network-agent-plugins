@@ -151,6 +151,47 @@ its full commit SHA, and fetches that immutable payload. A complete embedded
 checkout remains usable without Git or a ref, and the public emergency fallback
 remains pinned rather than depending on a mutable pointer.
 
+### Optional: make an internal mirror the embedded fallback
+
+The central configuration above is the normal deployment model. It keeps the
+public upstream metadata intact while making every managed client use the
+internal GitLab source. Use this procedure only when this repository will be
+rebuilt and distributed as an internal-only product, and an installer with no
+configuration must never fall back to the public GitHub URL.
+
+Changing `CANONICAL_SOURCE` alone does **not** make clients automatically follow
+newly approved releases. It is only the source fallback used when no CLI option,
+environment variable, central configuration, or local checkout is available.
+Keep the centrally deployed `plugins.source` set to the internal URL and omit
+`plugins.ref`; that is what makes clients resolve `latest-approved` and the
+immutable SHA in its release manifest.
+
+For an internal-only rebuild, make one reviewed release change that keeps these
+values aligned:
+
+1. Change `CANONICAL_SOURCE` in
+   `plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py`
+   to the credential-free internal Git URL.
+2. Change the top-level `repository` value in `catalog.json` to the same
+   internal URL so the catalog describes the distributed product.
+3. Keep `CANONICAL_REF` at a reviewed, reachable 40-character commit SHA. If
+   the internal product has diverged from the imported history, update it to
+   that product's reviewed release commit.
+4. Ensure the GitLab `publish:latest-approved` job continues to pass
+   `${CI_PROJECT_URL}.git` to `promote_release.py`; it writes the matching
+   internal source and approved SHA to each release manifest.
+5. Validate the release before publishing it:
+
+   ```bash
+   python3 -B scripts/validate_repo.py
+   python3 -B -m unittest discover -s tests -v
+   python3 -B tests/platform_verify.py --autocrlf true
+   ```
+
+Do not put credentials in `CANONICAL_SOURCE`, `catalog.json`, or a release
+manifest. Give runtime clients read-only repository access through the approved
+internal authentication mechanism.
+
 ## Central effective config
 
 The installer resolves each field independently, with this precedence:
