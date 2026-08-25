@@ -50,7 +50,7 @@ For an internal Git server:
 
 ```bash
 python3 scripts/plugin_installer.py install engineering-starter \
-  --source https://git.example.internal/agents/plugins.git \
+  --source https://git.example.internal/agents/closed-network-agent-plugins.git \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --target codex
 ```
