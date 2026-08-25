@@ -714,6 +714,10 @@ def _select_value(
 def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
     """Resolve plugin settings field-by-field using the documented precedence."""
     user_path, system_path = config_paths()
+    # config_paths is the platform authority for the current user's home. Using
+    # its parent also works in stripped-down Windows service/CI environments
+    # where pathlib.Path.home() cannot consult USERPROFILE or HOMEDRIVE/HOMEPATH.
+    user_home = user_path.parent.parent
     system = load_config(system_path)
     user = load_config(user_path)
     system_plugins = system.get("plugins", {})
@@ -822,10 +826,20 @@ def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
                 if ignored_agent_home_origin else "project-default"
             )
         else:
-            agent_home = str((Path.home() / leaf).resolve())
+            agent_home = str((user_home / leaf).resolve())
             provenance["agentHome"] = "user-default"
     else:
-        agent_home = str(Path(agent_home).expanduser().resolve())
+        if agent_home == "~":
+            resolved_home = user_home
+        elif agent_home.startswith("~/") or agent_home.startswith("~\\"):
+            resolved_home = user_home / agent_home[2:]
+        elif agent_home.startswith("~"):
+            raise InstallError(
+                "effective agent home only supports the current user's ~ prefix"
+            )
+        else:
+            resolved_home = Path(agent_home)
+        agent_home = str(resolved_home.resolve())
     if ref is not None and not FULL_SHA_RE.fullmatch(ref) and not allow_mutable:
         raise InstallError("effective ref must be a full commit SHA unless mutable refs are explicitly allowed")
     return EffectiveConfig(source, ref, allow_mutable, target, agent_home, scope, provenance)

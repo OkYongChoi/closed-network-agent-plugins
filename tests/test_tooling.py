@@ -994,7 +994,8 @@ class ToolingTests(unittest.TestCase):
     def test_effective_config_user_system_checkout_and_canonical_fallbacks(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            user_path = root / "missing-user.json"
+            user_home = root / "home"
+            user_path = user_home / ".agents" / "config.json"
             system_path = root / "system.json"
             system_path.write_text(json.dumps({
                 "plugins": {"source": "/system/source", "ref": "a" * 40},
@@ -1008,7 +1009,7 @@ class ToolingTests(unittest.TestCase):
                 effective = installer.resolve_effective_config(args)
             self.assertEqual(effective.source, "/system/source")
             self.assertEqual(effective.ref, "a" * 40)
-            self.assertEqual(effective.agent_home, str((Path.home() / ".company-agents").resolve()))
+            self.assertEqual(effective.agent_home, str((user_home / ".company-agents").resolve()))
             self.assertEqual(effective.target, "portable")
             self.assertEqual(effective.scope, "user")
 
@@ -1021,7 +1022,7 @@ class ToolingTests(unittest.TestCase):
                 checkout = installer.resolve_effective_config(args)
             self.assertEqual(Path(checkout.source), ROOT)
             self.assertIsNone(checkout.ref)
-            self.assertEqual(checkout.agent_home, str((Path.home() / ".agents").resolve()))
+            self.assertEqual(checkout.agent_home, str((user_home / ".agents").resolve()))
             self.assertEqual(checkout.provenance["source"], "current-checkout")
             self.assertEqual(checkout.provenance["ref"], "current-checkout")
 
