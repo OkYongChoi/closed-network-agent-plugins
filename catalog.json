@@ -15,7 +15,7 @@
     {
       "name": "plugin-installer",
       "path": "plugins/plugin-installer",
-      "content_sha256": "fd375ccd4d4e6b36be7f7c41089e20f1c3bf77adcc87cda6e8d72a656aff3ff3"
+      "content_sha256": "bbb25882ee61481739cef3e233a00df504cf17c29b38fcac2884764ec26db364"
     }
   ]
 }
