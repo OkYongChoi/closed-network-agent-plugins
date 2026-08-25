@@ -346,7 +346,7 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 
 On 2026-08-25, strict repository validation, all 50 tests, and an offline
 `core.autocrlf=true` clean-clone check passed. The corresponding
-[GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32706958783)
+[GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32803068633)
 passed on Ubuntu and Windows, including native Windows launchers, hard links,
 junctions, and process-handle checks. The vendored skill bytes match the pinned
 Skills source exactly, with no runtime fetch. Portable installation, the bundled
