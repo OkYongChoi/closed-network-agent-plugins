@@ -44,7 +44,7 @@ operator override, set both approved source and snapshot:
 
 ```bash
 export AGENT_PLUGINS_SOURCE=/srv/approved-mirrors/plugins
-export AGENT_PLUGINS_REF=49aa75b77a3c521aa160fad98f686eb9fb33b431
+export AGENT_PLUGINS_REF=67a89145f3878ed277e1c8e86d73fc9f7d69edf0
 ```
 
 On a Windows runner or workstation (PowerShell):
@@ -57,7 +57,7 @@ python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_instal
   install plugin-installer --source $PWD --target portable `
   --agent-home (Join-Path $HOME ".agents")
 $env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
-$env:AGENT_PLUGINS_REF = "49aa75b77a3c521aa160fad98f686eb9fb33b431"
+$env:AGENT_PLUGINS_REF = "67a89145f3878ed277e1c8e86d73fc9f7d69edf0"
 ```
 
 For normal managed use, deploy the JSON config described below rather than
@@ -288,7 +288,7 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 ### Validation status
 
 - Public repository: <https://github.com/OkYongChoi/plugins>
-- Verified implementation commit: `49aa75b77a3c521aa160fad98f686eb9fb33b431`
+- Verified implementation commit: `67a89145f3878ed277e1c8e86d73fc9f7d69edf0`
 - `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
 - Vendored `repo-summary` source: `OkYongChoi/skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
