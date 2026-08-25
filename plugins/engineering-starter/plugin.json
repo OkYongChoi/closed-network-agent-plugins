@@ -7,8 +7,8 @@
     "name": "OkYongChoi",
     "url": "https://github.com/OkYongChoi"
   },
-  "homepage": "https://github.com/OkYongChoi/plugins",
-  "repository": "https://github.com/OkYongChoi/plugins",
+  "homepage": "https://github.com/OkYongChoi/closed-network-agent-plugins",
+  "repository": "https://github.com/OkYongChoi/closed-network-agent-plugins",
   "license": "Apache-2.0",
   "keywords": ["engineering", "repository", "summary", "offline"]
 }

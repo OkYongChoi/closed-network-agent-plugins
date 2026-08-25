@@ -1,21 +1,21 @@
 {
   "format_version": 1,
-  "repository": "https://github.com/OkYongChoi/plugins.git",
+  "repository": "https://github.com/OkYongChoi/closed-network-agent-plugins.git",
   "plugins": [
     {
       "name": "engineering-starter",
       "path": "plugins/engineering-starter",
-      "content_sha256": "b77a0209bc7a4821033169887ab3df48689e3d81875613f16577fb71f1fc2abd"
+      "content_sha256": "ca1289d2e556ba19d2b9f6f262e7c0decc2136e9f6d26718884472f14621901d"
     },
     {
       "name": "plugin-creator",
       "path": "plugins/plugin-creator",
-      "content_sha256": "822e3d506eb694716e5a259595173a49d2ec432b07ceea955df82f7cda9efee2"
+      "content_sha256": "4fa4c4f33004965ba56bb50ad51433594ae5d4f296dd5ce5917805d6e1468b83"
     },
     {
       "name": "plugin-installer",
       "path": "plugins/plugin-installer",
-      "content_sha256": "a2b392269a8cc83ab01ab5d3d5331cc184d2c1e19ddf29cd835e89ba29b8234b"
+      "content_sha256": "997e36cf1ee185b4cfbf147248692f99d2233d560cae5c58c446bb2a97835c82"
     }
   ]
 }

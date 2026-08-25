@@ -26,7 +26,7 @@ from typing import Any, Iterator, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 
-CANONICAL_SOURCE = "https://github.com/OkYongChoi/plugins.git"
+CANONICAL_SOURCE = "https://github.com/OkYongChoi/closed-network-agent-plugins.git"
 APPROVED_POINTER_REF = "refs/heads/latest-approved"
 CANONICAL_REF = "317afbf9019f877205a3b89783bf190ba857dc7d"
 PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"

@@ -1,6 +1,7 @@
 # Portable Agent Plugins for closed networks
 
-This repository is the public source for `OkYongChoi/plugins`. It packages
+This repository is the public source for
+`OkYongChoi/closed-network-agent-plugins`. It packages
 portable [Agent Plugins 1.0](https://github.com/agentplugins/agent-plugins-spec/blob/ff8ab5e392cc87bd88d87c060815a87490e51003/spec/1.0.0.md)
 without runtime package-manager or GitHub API dependencies. Python scripts use
 only the standard library and Git CLI. The supported runtime baseline is
@@ -19,21 +20,104 @@ directory. Optional MCP configuration belongs only at `mcp.json`. Vendor files
 such as `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json` are generated
 outside the canonical package or during target installation.
 
+## Get and use this repository
+
+Clone the connected-side source, validate it, and install the plugin target you
+need. Installation from the checkout is fully local:
+
+```bash
+git clone https://github.com/OkYongChoi/closed-network-agent-plugins.git
+cd closed-network-agent-plugins
+python3 -B scripts/validate_repo.py
+./bin/plugin-installer list
+./bin/plugin-installer install engineering-starter --target portable
+```
+
+On Windows PowerShell:
+
+```powershell
+git clone https://github.com/OkYongChoi/closed-network-agent-plugins.git
+Set-Location closed-network-agent-plugins
+python -B scripts/validate_repo.py
+bin\plugin-installer.ps1 install engineering-starter --target portable
+```
+
+Portable installations default to `~/.agents/plugins` on Linux/macOS and
+`%USERPROFILE%\.agents\plugins` on Windows. Select `--target codex` or
+`--target claude` for an isolated vendor projection. For a closed network,
+mirror the repository as shown below and centrally configure the internal
+GitLab source; end users then run only `install NAME` or `update NAME`.
+
+### Bring both repositories into an internal GitLab
+
+Mirror and transfer both repositories so plugin builds can refer to the
+companion Skills source without using the public network:
+
+```bash
+git clone --mirror https://github.com/OkYongChoi/closed-network-agent-skills.git
+git clone --mirror https://github.com/OkYongChoi/closed-network-agent-plugins.git
+git --git-dir closed-network-agent-skills.git push --mirror \
+  https://gitlab.company.local/ai/closed-network-agent-skills.git
+git --git-dir closed-network-agent-plugins.git push --mirror \
+  https://gitlab.company.local/ai/closed-network-agent-plugins.git
+```
+
+Deploy this source-only configuration to `/etc/agent-tools/config.json` on
+Linux or `%ProgramData%\AgentTools\config.json` on Windows:
+
+```json
+{
+  "skills": {
+    "source": "https://gitlab.company.local/ai/closed-network-agent-skills.git",
+    "allowMutableRef": false
+  },
+  "plugins": {
+    "source": "https://gitlab.company.local/ai/closed-network-agent-plugins.git",
+    "allowMutableRef": false,
+    "defaultTarget": "portable"
+  },
+  "agentHome": "~/.agents"
+}
+```
+
+With `ref` omitted, the installers resolve `latest-approved` to an immutable
+commit. After the one-time portable installer bootstrap, Linux/macOS users run:
+
+```bash
+plugin_installer=~/.agents/plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py
+python3 -B "$plugin_installer" list
+python3 -B "$plugin_installer" install engineering-starter
+python3 -B "$plugin_installer" update engineering-starter
+```
+
+On Windows PowerShell:
+
+```powershell
+$installer = "$env:USERPROFILE\.agents\plugins\plugin-installer\skills\plugin-installer\scripts\plugin_installer.py"
+python -B $installer list
+python -B $installer install engineering-starter
+python -B $installer update engineering-starter
+```
+
+The Skills repository contains the matching `repo-summary` install/update
+commands. Repository-level `bin/` wrappers remain available when operating from
+a checkout, but are not part of the portable `plugin-installer` package.
+
 ## Closed-network bootstrap
 
 On a connected transfer host, create a bare mirror and record the reviewed
 commit before moving it through your approved transfer process:
 
 ```bash
-git clone --mirror https://github.com/OkYongChoi/plugins.git plugins.git
-git --git-dir plugins.git rev-parse refs/heads/main
+git clone --mirror https://github.com/OkYongChoi/closed-network-agent-plugins.git closed-network-agent-plugins.git
+git --git-dir closed-network-agent-plugins.git rev-parse refs/heads/main
 ```
 
 Then publish the mirror and clone it from the internal Git service:
 
 ```bash
-git clone https://git.example.internal/agents/plugins.git
-cd plugins
+git clone https://git.example.internal/agents/closed-network-agent-plugins.git
+cd closed-network-agent-plugins
 python3 -B scripts/validate_repo.py
 python3 -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py \
   install plugin-installer --source "$PWD" --target portable --agent-home ~/.agents
@@ -50,8 +134,8 @@ export AGENT_PLUGINS_REF=317afbf9019f877205a3b89783bf190ba857dc7d
 On a Windows runner or workstation (PowerShell):
 
 ```powershell
-git clone https://git.example.internal/agents/plugins.git
-Set-Location plugins
+git clone https://git.example.internal/agents/closed-network-agent-plugins.git
+Set-Location closed-network-agent-plugins
 python -B scripts/validate_repo.py
 python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py `
   install plugin-installer --source $PWD --target portable `
@@ -85,12 +169,12 @@ Only JSON is accepted. A shared Skills/Plugins configuration looks like:
 ```json
 {
   "skills": {
-    "source": "https://gitlab.company.local/ai/skills.git",
+    "source": "https://gitlab.company.local/ai/closed-network-agent-skills.git",
     "ref": "0123456789abcdef0123456789abcdef01234567",
     "allowMutableRef": false
   },
   "plugins": {
-    "source": "https://gitlab.company.local/ai/plugins.git",
+    "source": "https://gitlab.company.local/ai/closed-network-agent-plugins.git",
     "allowMutableRef": false,
     "defaultTarget": "portable"
   },
@@ -145,7 +229,7 @@ Import a skill from a pinned internal Git source:
 
 ```bash
 ./bin/create-plugin engineering-tools --output ./work \
-  --import-skill https://git.example.internal/agents/skills.git \
+  --import-skill https://git.example.internal/agents/closed-network-agent-skills.git \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --path skills/repo-summary
 ```
@@ -200,7 +284,7 @@ is useful for audit reproduction or development diagnostics:
 
 ```bash
 ./bin/plugin-installer install engineering-starter \
-  --source https://git.example.internal/agents/plugins.git \
+  --source https://git.example.internal/agents/closed-network-agent-plugins.git \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --target codex
 ```
@@ -344,15 +428,15 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 
 ### Validation status
 
-- Public repository: <https://github.com/OkYongChoi/plugins>
+- Public repository: <https://github.com/OkYongChoi/closed-network-agent-plugins>
 - Verified implementation commit: `317afbf9019f877205a3b89783bf190ba857dc7d`
 - `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
-- Vendored `repo-summary` source: `OkYongChoi/skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
+- Vendored `repo-summary` source: `OkYongChoi/closed-network-agent-skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
 
 On 2026-08-25, strict repository validation, all 51 tests, and an offline
 `core.autocrlf=true` clean-clone check passed. The corresponding
-[GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32811809835)
+[GitHub Actions run](https://github.com/OkYongChoi/closed-network-agent-plugins/actions/runs/32811809835)
 passed on Ubuntu and Windows, including native Windows launchers, hard links,
 junctions, and process-handle checks. The vendored skill bytes match the pinned
 Skills source exactly, with no runtime fetch. Portable installation, the bundled
