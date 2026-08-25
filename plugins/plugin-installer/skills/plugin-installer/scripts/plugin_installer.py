@@ -28,7 +28,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 CANONICAL_SOURCE = "https://github.com/OkYongChoi/closed-network-agent-plugins.git"
 APPROVED_POINTER_REF = "refs/heads/latest-approved"
-CANONICAL_REF = "317afbf9019f877205a3b89783bf190ba857dc7d"
+CANONICAL_REF = "e0fbb53a8d04a26fd6f14051ed4ca855edb31070"
 PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 NAME_RE = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")

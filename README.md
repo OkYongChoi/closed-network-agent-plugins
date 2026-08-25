@@ -128,7 +128,7 @@ operator override, set both approved source and snapshot:
 
 ```bash
 export AGENT_PLUGINS_SOURCE=/srv/approved-mirrors/plugins
-export AGENT_PLUGINS_REF=317afbf9019f877205a3b89783bf190ba857dc7d
+export AGENT_PLUGINS_REF=e0fbb53a8d04a26fd6f14051ed4ca855edb31070
 ```
 
 On a Windows runner or workstation (PowerShell):
@@ -141,7 +141,7 @@ python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_instal
   install plugin-installer --source $PWD --target portable `
   --agent-home (Join-Path $HOME ".agents")
 $env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
-$env:AGENT_PLUGINS_REF = "317afbf9019f877205a3b89783bf190ba857dc7d"
+$env:AGENT_PLUGINS_REF = "e0fbb53a8d04a26fd6f14051ed4ca855edb31070"
 ```
 
 For normal managed use, deploy only the approved GitLab source in JSON config.
@@ -429,7 +429,7 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 ### Validation status
 
 - Public repository: <https://github.com/OkYongChoi/closed-network-agent-plugins>
-- Verified implementation commit: `317afbf9019f877205a3b89783bf190ba857dc7d`
+- Verified implementation commit: `e0fbb53a8d04a26fd6f14051ed4ca855edb31070`
 - `plugin-creator` pattern source: `openai/skills@e940b8a86138adf03972802b990a1dfc57fcbf09`
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
 - Vendored `repo-summary` source: `OkYongChoi/closed-network-agent-skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
