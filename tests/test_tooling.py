@@ -915,6 +915,249 @@ class ToolingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(Path(installer.choose_source(None)), ROOT)
 
+    def test_effective_config_precedence_is_per_field(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            user_path = root / "user.json"
+            system_path = root / "system.json"
+            system_path.write_text(json.dumps({
+                "plugins": {
+                    "source": "/system/source",
+                    "ref": "1" * 40,
+                    "allowMutableRef": True,
+                    "defaultTarget": "claude",
+                },
+                "agentHome": "/system/home",
+            }), encoding="utf-8")
+            user_path.write_text(json.dumps({
+                "skills": {"source": "/shared/skills", "allowMutableRef": False},
+                "plugins": {
+                    "ref": "2" * 40,
+                    "allowMutableRef": False,
+                    "defaultTarget": "codex",
+                },
+                "agentHome": "/user/home",
+            }), encoding="utf-8")
+            args = installer.parser().parse_args([
+                "install", "engineering-starter",
+                "--source", "/cli/source",
+                "--target", "portable",
+                "--scope", "project",
+                "--agent-home", "/cli/home",
+                "--no-allow-mutable-ref",
+            ])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {"AGENT_PLUGINS_REF": "3" * 40}, clear=True),
+            ):
+                effective = installer.resolve_effective_config(args)
+            self.assertEqual(effective.source, "/cli/source")
+            self.assertEqual(effective.ref, "3" * 40)
+            self.assertEqual(effective.target, "portable")
+            self.assertEqual(effective.agent_home, str(Path("/cli/home").resolve()))
+            self.assertEqual(effective.scope, "project")
+            self.assertFalse(effective.allow_mutable_ref)
+            self.assertEqual(effective.provenance["source"], "cli")
+            self.assertEqual(effective.provenance["ref"], "environment:AGENT_PLUGINS_REF")
+            self.assertEqual(effective.provenance["allowMutableRef"], "cli")
+
+            managed_args = installer.parser().parse_args(["install", "engineering-starter"])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {
+                    "AGENT_PLUGINS_SOURCE": "/environment/source",
+                    "AGENT_PLUGINS_REF": "3" * 40,
+                }, clear=True),
+            ):
+                managed = installer.resolve_effective_config(managed_args)
+            self.assertEqual(managed.source, "/environment/source")
+            self.assertEqual(managed.ref, "3" * 40)
+            self.assertEqual(managed.target, "codex")
+            self.assertEqual(managed.agent_home, str(Path("/user/home").resolve()))
+            self.assertFalse(managed.allow_mutable_ref)
+            self.assertEqual(managed.provenance["target"], "user-config")
+
+            project_args = installer.parser().parse_args([
+                "install", "engineering-starter", "--scope", "project"
+            ])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {
+                    "AGENT_PLUGINS_SOURCE": "/environment/source",
+                    "AGENT_PLUGINS_REF": "3" * 40,
+                }, clear=True),
+            ):
+                project = installer.resolve_effective_config(project_args)
+            self.assertEqual(project.agent_home, str((Path.cwd() / ".agents").resolve()))
+            self.assertEqual(project.provenance["agentHome"], "project-default:ignored-user-config")
+
+    def test_effective_config_user_system_checkout_and_canonical_fallbacks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            user_path = root / "missing-user.json"
+            system_path = root / "system.json"
+            system_path.write_text(json.dumps({
+                "plugins": {"source": "/system/source", "ref": "a" * 40},
+                "agentHome": "~/.company-agents",
+            }), encoding="utf-8")
+            args = installer.parser().parse_args(["install", "engineering-starter"])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                effective = installer.resolve_effective_config(args)
+            self.assertEqual(effective.source, "/system/source")
+            self.assertEqual(effective.ref, "a" * 40)
+            self.assertEqual(effective.agent_home, str((Path.home() / ".company-agents").resolve()))
+            self.assertEqual(effective.target, "portable")
+            self.assertEqual(effective.scope, "user")
+
+            system_path.unlink()
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.object(installer, "discover_checkout", return_value=ROOT),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                checkout = installer.resolve_effective_config(args)
+            self.assertEqual(Path(checkout.source), ROOT)
+            self.assertIsNone(checkout.ref)
+            self.assertEqual(checkout.agent_home, str((Path.home() / ".agents").resolve()))
+            self.assertEqual(checkout.provenance["source"], "current-checkout")
+            self.assertEqual(checkout.provenance["ref"], "current-checkout")
+
+            local_args = installer.parser().parse_args([
+                "install", "engineering-starter", "--source", str(ROOT)
+            ])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                local = installer.resolve_effective_config(local_args)
+            self.assertEqual(Path(local.source), ROOT)
+            self.assertIsNone(local.ref)
+            self.assertEqual(local.provenance["ref"], "local-source")
+
+            remote_args = installer.parser().parse_args([
+                "install", "engineering-starter",
+                "--source", "https://git.example/internal/plugins.git",
+            ])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                remote = installer.resolve_effective_config(remote_args)
+            self.assertIsNone(remote.ref)
+            self.assertEqual(remote.provenance["ref"], "unset")
+            with self.assertRaises(installer.InstallError):
+                with installer.materialize_source(
+                    remote.source, remote.ref, remote.allow_mutable_ref
+                ):
+                    pass
+
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
+                mock.patch.object(installer, "discover_checkout", return_value=None),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                canonical = installer.resolve_effective_config(args)
+            self.assertEqual(canonical.source, installer.CANONICAL_SOURCE)
+            self.assertEqual(canonical.ref, installer.CANONICAL_REF)
+
+    def test_effective_config_strict_json_and_ref_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            invalid_payloads = (
+                '{"plugins": {}, "plugins": {}}',
+                '{"unknown": true}',
+                '{"plugins": {"source": 42}}',
+                '{"plugins": {"allowMutableRef": "false"}}',
+                '{"plugins": {"defaultTarget": "other"}}',
+                '{"agentHome": " surrounded "}',
+                json.dumps({"agentHome": "x\x00y"}),
+                json.dumps({"plugins": {"source": "x\x00y"}}),
+                '[]',
+            )
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaises(installer.InstallError):
+                        installer.load_config(path)
+
+            path.write_text(json.dumps({
+                "plugins": {"source": "https://git.example/plugins.git", "ref": "main"}
+            }), encoding="utf-8")
+            missing = Path(temp) / "missing.json"
+            args = installer.parser().parse_args(["list"])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(path, missing)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                with self.assertRaises(installer.InstallError):
+                    installer.resolve_effective_config(args)
+
+            path.write_text(json.dumps({
+                "plugins": {
+                    "source": "https://git.example/plugins.git",
+                    "ref": "main",
+                    "allowMutableRef": True,
+                }
+            }), encoding="utf-8")
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(path, missing)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertTrue(installer.resolve_effective_config(args).allow_mutable_ref)
+
+            cli_nul = installer.parser().parse_args([
+                "install", "engineering-starter", "--agent-home", "x\x00y"
+            ])
+            with (
+                mock.patch.object(installer, "config_paths", return_value=(missing, missing)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                with self.assertRaises(installer.InstallError):
+                    installer.resolve_effective_config(cli_nul)
+
+    def test_effective_config_rejects_linked_config_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            real = root / "real.json"
+            real.write_text("{}", encoding="utf-8")
+            linked = root / "linked.json"
+            try:
+                linked.symlink_to(real)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            with self.assertRaises(installer.InstallError):
+                installer.load_config(linked)
+
+            hard_link = root / "hard-linked.json"
+            try:
+                os.link(real, hard_link)
+            except OSError as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+            with self.assertRaises(installer.InstallError):
+                installer.load_config(real)
+            with self.assertRaises(installer.InstallError):
+                installer.load_config(hard_link)
+
+    def test_effective_config_diagnostic_redacts_url_credentials(self):
+        config = installer.EffectiveConfig(
+            "https://user:secret@git.example/plugins.git?token=secret#fragment",
+            "a" * 40,
+            False,
+            "portable",
+            None,
+            "user",
+            {"source": "cli"},
+        )
+        rendered = json.dumps(installer.effective_config_payload(config))
+        self.assertNotIn("user:secret", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertIn("***@git.example", rendered)
+        self.assertIn("REDACTED", rendered)
+        self.assertEqual(installer._redact_source("https://git.example:invalid/repo"), "<invalid-url>")
+
     def test_remote_source_requires_full_sha(self):
         with self.assertRaises(installer.InstallError):
             with installer.materialize_source("https://example.invalid/plugins.git", None, False):

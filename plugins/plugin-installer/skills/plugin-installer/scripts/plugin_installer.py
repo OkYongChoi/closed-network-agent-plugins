@@ -22,10 +22,11 @@ import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 CANONICAL_SOURCE = "https://github.com/OkYongChoi/plugins.git"
+CANONICAL_REF = "76fa8e785cb9d8a1d73dac451a9a5792ded10fe6"
 PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 NAME_RE = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -54,10 +55,24 @@ WINDOWS_RESERVED_NAMES = {
 }
 WINDOWS_FORBIDDEN_CHARS = frozenset('<>:"/\\|?*')
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+MAX_CONFIG_BYTES = 64 * 1024
+CONFIG_TOP_LEVEL_KEYS = frozenset({"skills", "plugins", "agentHome"})
+CONFIG_REPOSITORY_KEYS = frozenset({"source", "ref", "allowMutableRef"})
+CONFIG_PLUGIN_KEYS = CONFIG_REPOSITORY_KEYS | {"defaultTarget"}
 
 
 class InstallError(RuntimeError):
     """Expected source, validation, or installation failure."""
+
+
+class EffectiveConfig(NamedTuple):
+    source: str
+    ref: str | None
+    allow_mutable_ref: bool
+    target: str
+    agent_home: str | None
+    scope: str
+    provenance: dict[str, str]
 
 
 def _portable_key(value: str) -> str:
@@ -540,6 +555,313 @@ def load_plugin(root: Path) -> LoadedPlugin:
     skills = _load_skills(root, warnings)
     mcp = _load_mcp(root, warnings)
     return LoadedPlugin(manifest, skills, mcp, tuple(warnings))
+
+
+def config_paths() -> tuple[Path, Path]:
+    """Return user and system config paths for the current platform."""
+    if os.name == "nt":
+        user_root = Path(os.environ.get("USERPROFILE") or Path.home())
+        system_root = Path(os.environ.get("ProgramData") or "C:/ProgramData")
+        return user_root / ".agents" / "config.json", system_root / "AgentTools" / "config.json"
+    return Path.home() / ".agents" / "config.json", Path("/etc/agent-tools/config.json")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _valid_config_string(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and "\x00" not in value
+    )
+
+
+def _validate_repository_config(value: Any, *, section: str, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise InstallError(f"invalid config {path}: {section} must be an object")
+    allowed = CONFIG_PLUGIN_KEYS if section == "plugins" else CONFIG_REPOSITORY_KEYS
+    unknown = set(value) - allowed
+    if unknown:
+        raise InstallError(f"invalid config {path}: unknown {section} key(s): {', '.join(sorted(unknown))}")
+    for key in ("source", "ref"):
+        if key in value and not _valid_config_string(value[key]):
+            raise InstallError(
+                f"invalid config {path}: {section}.{key} must be a non-empty, trimmed string without NUL"
+            )
+    if "allowMutableRef" in value and not isinstance(value["allowMutableRef"], bool):
+        raise InstallError(f"invalid config {path}: {section}.allowMutableRef must be boolean")
+    if section == "plugins" and "defaultTarget" in value:
+        if value["defaultTarget"] not in {"portable", "codex", "claude"}:
+            raise InstallError(
+                f"invalid config {path}: plugins.defaultTarget must be portable, codex, or claude"
+            )
+
+
+def _read_config_bytes(path: Path) -> bytes | None:
+    """Read a real, singly-linked config file without following a final symlink."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallError(f"cannot inspect config {path}: {exc}") from exc
+    if path.is_symlink() or _is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise InstallError(f"config must be a real regular file, not a link or reparse point: {path}")
+    if _file_link_count(path, before) != 1:
+        raise InstallError(f"config must not be hard-linked: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise InstallError(f"cannot open config safely {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if _is_reparse(opened) or not stat.S_ISREG(opened.st_mode):
+            raise InstallError(f"opened config is not a real regular file: {path}")
+        if _file_link_count(path, opened) != 1:
+            raise InstallError(f"opened config must not be hard-linked: {path}")
+        before_identity = (getattr(before, "st_dev", None), getattr(before, "st_ino", None))
+        opened_identity = (getattr(opened, "st_dev", None), getattr(opened, "st_ino", None))
+        if before_identity != opened_identity:
+            raise InstallError(f"config changed while it was being opened: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(8192, MAX_CONFIG_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_CONFIG_BYTES:
+                raise InstallError(f"config is larger than {MAX_CONFIG_BYTES} bytes: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    """Load one strict, size-bounded JSON config; an absent file is an empty layer."""
+    raw = _read_config_bytes(path)
+    if raw is None:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError(f"invalid JSON config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise InstallError(f"invalid config {path}: top level must be an object")
+    unknown = set(data) - CONFIG_TOP_LEVEL_KEYS
+    if unknown:
+        raise InstallError(f"invalid config {path}: unknown top-level key(s): {', '.join(sorted(unknown))}")
+    if "agentHome" in data and not _valid_config_string(data["agentHome"]):
+        raise InstallError(
+            f"invalid config {path}: agentHome must be a non-empty, trimmed string without NUL"
+        )
+    for section in ("skills", "plugins"):
+        if section in data:
+            _validate_repository_config(data[section], section=section, path=path)
+    return data
+
+
+def _environment_value(name: str) -> str | None:
+    if name not in os.environ:
+        return None
+    value = os.environ[name]
+    if not _valid_config_string(value):
+        raise InstallError(
+            f"environment variable {name} must be non-empty, trimmed, and contain no NUL"
+        )
+    return value
+
+
+def _select_value(
+    cli_value: Any,
+    environment_name: str | None,
+    user_value: Any,
+    system_value: Any,
+    fallback: Any,
+    *,
+    field: str,
+    provenance: dict[str, str],
+) -> Any:
+    if cli_value is not None:
+        provenance[field] = "cli"
+        return cli_value
+    if environment_name:
+        environment = _environment_value(environment_name)
+        if environment is not None:
+            provenance[field] = f"environment:{environment_name}"
+            return environment
+    if user_value is not None:
+        provenance[field] = "user-config"
+        return user_value
+    if system_value is not None:
+        provenance[field] = "system-config"
+        return system_value
+    provenance[field] = "embedded-fallback"
+    return fallback
+
+
+def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
+    """Resolve plugin settings field-by-field using the documented precedence."""
+    user_path, system_path = config_paths()
+    system = load_config(system_path)
+    user = load_config(user_path)
+    system_plugins = system.get("plugins", {})
+    user_plugins = user.get("plugins", {})
+    provenance: dict[str, str] = {}
+
+    cli_source = getattr(args, "source", None)
+    cli_ref = getattr(args, "ref", None)
+    checkout = discover_checkout()
+    configured_source = _select_value(
+        cli_source,
+        "AGENT_PLUGINS_SOURCE",
+        user_plugins.get("source"),
+        system_plugins.get("source"),
+        None,
+        field="source",
+        provenance=provenance,
+    )
+    configured_ref = _select_value(
+        cli_ref,
+        "AGENT_PLUGINS_REF",
+        user_plugins.get("ref"),
+        system_plugins.get("ref"),
+        None,
+        field="ref",
+        provenance=provenance,
+    )
+    if configured_source is not None and not _valid_config_string(configured_source):
+        raise InstallError("effective source must be a non-empty, trimmed string without NUL")
+    if configured_ref is not None and not _valid_config_string(configured_ref):
+        raise InstallError("effective ref must be a non-empty, trimmed string without NUL")
+    if configured_source is None and checkout is not None:
+        source = str(checkout)
+        provenance["source"] = "current-checkout"
+        ref = configured_ref
+        if ref is None:
+            provenance["ref"] = "current-checkout"
+    else:
+        source = configured_source or CANONICAL_SOURCE
+        if configured_source is None:
+            provenance["source"] = "embedded-fallback"
+        if configured_ref is not None:
+            ref = configured_ref
+        elif configured_source is not None:
+            # A selected local checkout remains valid without a ref. A selected
+            # remote never inherits the unrelated canonical repository's SHA;
+            # materialization will report that its own approved ref is missing.
+            ref = None
+            provenance["ref"] = (
+                "local-source" if Path(source).expanduser().exists() else "unset"
+            )
+        else:
+            ref = CANONICAL_REF
+            provenance["ref"] = "embedded-fallback"
+
+    cli_mutable = getattr(args, "allow_mutable_ref", None)
+    allow_mutable = _select_value(
+        cli_mutable,
+        None,
+        user_plugins.get("allowMutableRef"),
+        system_plugins.get("allowMutableRef"),
+        False,
+        field="allowMutableRef",
+        provenance=provenance,
+    )
+    target = _select_value(
+        getattr(args, "target", None),
+        None,
+        user_plugins.get("defaultTarget"),
+        system_plugins.get("defaultTarget"),
+        "portable",
+        field="target",
+        provenance=provenance,
+    )
+    agent_home = _select_value(
+        getattr(args, "agent_home", None),
+        None,
+        user.get("agentHome"),
+        system.get("agentHome"),
+        None,
+        field="agentHome",
+        provenance=provenance,
+    )
+    scope = _select_value(
+        getattr(args, "scope", None),
+        None,
+        None,
+        None,
+        "user",
+        field="scope",
+        provenance=provenance,
+    )
+    ignored_agent_home_origin: str | None = None
+    if scope == "project" and agent_home is not None and provenance["agentHome"] != "cli":
+        origin = provenance["agentHome"]
+        agent_home = None
+        ignored_agent_home_origin = origin
+    if agent_home is not None and not _valid_config_string(agent_home):
+        raise InstallError("effective agent home must be a non-empty, trimmed string without NUL")
+    if agent_home is None:
+        leaf = ".claude" if target == "claude" else ".agents"
+        if scope == "project":
+            agent_home = str((Path.cwd() / leaf).resolve())
+            provenance["agentHome"] = (
+                f"project-default:ignored-{ignored_agent_home_origin}"
+                if ignored_agent_home_origin else "project-default"
+            )
+        else:
+            agent_home = str((Path.home() / leaf).resolve())
+            provenance["agentHome"] = "user-default"
+    else:
+        agent_home = str(Path(agent_home).expanduser().resolve())
+    if ref is not None and not FULL_SHA_RE.fullmatch(ref) and not allow_mutable:
+        raise InstallError("effective ref must be a full commit SHA unless mutable refs are explicitly allowed")
+    return EffectiveConfig(source, ref, allow_mutable, target, agent_home, scope, provenance)
+
+
+def _redact_source(source: str) -> str:
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        return "<invalid-url>"
+    if not parsed.scheme or not parsed.netloc:
+        return source
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "<invalid-url>"
+    if port is not None:
+        hostname = f"{hostname}:{port}"
+    netloc = f"***@{hostname}" if parsed.username is not None else hostname
+    query = "REDACTED" if parsed.query else ""
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
+
+
+def effective_config_payload(config: EffectiveConfig) -> dict[str, Any]:
+    return {
+        "source": _redact_source(config.source),
+        "ref": config.ref,
+        "allowMutableRef": config.allow_mutable_ref,
+        "target": config.target,
+        "agentHome": config.agent_home,
+        "scope": config.scope,
+        "provenance": config.provenance,
+    }
 
 
 def discover_checkout() -> Path | None:
@@ -1193,22 +1515,38 @@ def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source")
     common.add_argument("--ref")
-    common.add_argument("--allow-mutable-ref", action="store_true")
+    mutable = common.add_mutually_exclusive_group()
+    mutable.add_argument("--allow-mutable-ref", action="store_true", default=None)
+    mutable.add_argument("--no-allow-mutable-ref", action="store_false", dest="allow_mutable_ref")
     sub.add_parser("list", parents=[common], help="list catalogued plugins")
     install_parser = sub.add_parser("install", parents=[common], help="install a catalogued plugin")
     install_parser.add_argument("name")
-    install_parser.add_argument("--target", choices=("portable", "codex", "claude"), required=True)
+    install_parser.add_argument("--target", choices=("portable", "codex", "claude"))
     install_parser.add_argument("--agent-home")
-    install_parser.add_argument("--scope", choices=("user", "project"), default="user")
+    install_parser.add_argument("--scope", choices=("user", "project"))
     install_parser.add_argument("--dest", help="override the destination plugin parent")
+    config_parser = sub.add_parser(
+        "effective-config", parents=[common], help="print resolved settings and their provenance"
+    )
+    config_parser.add_argument("--target", choices=("portable", "codex", "claude"))
+    config_parser.add_argument("--agent-home")
+    config_parser.add_argument("--scope", choices=("user", "project"))
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        source = choose_source(args.source)
-        with materialize_source(source, args.ref, args.allow_mutable_ref) as (root, actual_ref):
+        effective = resolve_effective_config(args)
+        if args.command == "effective-config":
+            print(json.dumps(effective_config_payload(effective), indent=2, sort_keys=True))
+            return 0
+        args.target = effective.target
+        args.agent_home = effective.agent_home
+        args.scope = effective.scope
+        with materialize_source(
+            effective.source, effective.ref, effective.allow_mutable_ref
+        ) as (root, actual_ref):
             entries = read_catalog(root)
             if args.command == "list":
                 for entry in entries:

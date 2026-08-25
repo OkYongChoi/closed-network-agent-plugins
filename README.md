@@ -39,10 +39,12 @@ python3 -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_insta
   install plugin-installer --source "$PWD" --target portable --agent-home ~/.agents
 ```
 
-No network is used when `--source` is a local checkout. For ongoing use, set:
+No network is used when `--source` is a local checkout. For a temporary
+operator override, set both approved source and snapshot:
 
 ```bash
 export AGENT_PLUGINS_SOURCE=/srv/approved-mirrors/plugins
+export AGENT_PLUGINS_REF=76fa8e785cb9d8a1d73dac451a9a5792ded10fe6
 ```
 
 On a Windows runner or workstation (PowerShell):
@@ -55,12 +57,71 @@ python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_instal
   install plugin-installer --source $PWD --target portable `
   --agent-home (Join-Path $HOME ".agents")
 $env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
+$env:AGENT_PLUGINS_REF = "76fa8e785cb9d8a1d73dac451a9a5792ded10fe6"
 ```
 
-Source selection is `--source` → `AGENT_PLUGINS_SOURCE` → the checkout that
-contains the running installer → `https://github.com/OkYongChoi/plugins.git`.
-The final remote fallback intentionally fails until a full `--ref` is supplied;
-it never installs from an implicit moving branch.
+For normal managed use, deploy the JSON config described below rather than
+asking each user to export these variables. The final canonical fallback is
+pinned to a reviewed full commit SHA; it never resolves an implicit moving
+branch.
+
+## Central effective config
+
+The installer resolves each field independently, with this precedence:
+
+1. CLI (`--source`, `--ref`, `--target`, `--agent-home`, `--scope`)
+2. `AGENT_PLUGINS_SOURCE` and `AGENT_PLUGINS_REF`
+3. user config: `~/.agents/config.json` on Linux/macOS or
+   `%USERPROFILE%\.agents\config.json` on Windows
+4. system config: `/etc/agent-tools/config.json` on Linux or
+   `%ProgramData%\AgentTools\config.json` on Windows
+5. the checkout containing the running installer
+6. the embedded canonical source and approved full commit SHA
+
+Only JSON is accepted. A shared Skills/Plugins configuration looks like:
+
+```json
+{
+  "skills": {
+    "source": "https://gitlab.company.local/ai/skills.git",
+    "ref": "0123456789abcdef0123456789abcdef01234567",
+    "allowMutableRef": false
+  },
+  "plugins": {
+    "source": "https://gitlab.company.local/ai/plugins.git",
+    "ref": "abcdef0123456789abcdef0123456789abcdef01",
+    "allowMutableRef": false,
+    "defaultTarget": "portable"
+  },
+  "agentHome": "~/.agents"
+}
+```
+
+Unknown or duplicate keys, wrong types, empty source/ref values, invalid
+targets, and a non-full ref without `allowMutableRef: true` fail closed. Branch
+and tag refs remain an explicit development-only exception. An installed copy
+that is not inside a repository uses the embedded pinned fallback; an installer
+running from a complete local checkout continues to use that checkout without
+a ref. A configured remote source without its own ref does not inherit the
+canonical repository's SHA and fails with a missing-ref error. Config files
+must be real, singly-linked regular files; symlinks, hard links, and Windows
+reparse points are rejected.
+
+Administrators can verify the effective non-secret values and provenance:
+
+```bash
+./bin/plugin-installer effective-config
+```
+
+```powershell
+bin\plugin-installer.ps1 effective-config
+```
+
+The diagnostic redacts URL userinfo and query values and removes fragments.
+It prints the expanded effective agent-home path, including the target/scope
+default when no path was configured.
+Environment variables exist for controlled process-level overrides, not as a
+required end-user setup step.
 
 ## Create plugins
 
@@ -89,15 +150,13 @@ Import a skill from a pinned internal Git source:
 ## List and install
 
 ```bash
-./bin/plugin-installer list --source /srv/approved-mirrors/plugins
+./bin/plugin-installer list
 
-./bin/plugin-installer install engineering-starter \
-  --source /srv/approved-mirrors/plugins \
-  --target portable \
-  --agent-home ~/.agents
+./bin/plugin-installer install engineering-starter
 ```
 
-Targets are explicit: `portable`, `codex`, or `claude`. Portable user installs
+Targets are `portable`, `codex`, or `claude`; central config can select one and
+the default is `portable`. Scope defaults to `user`. Portable user installs
 use `~/.agents/plugins/<name>`. Codex uses its native split layout:
 `~/.agents/plugins/marketplace.json` plus `~/plugins/<name>`, so the marketplace
 source `./plugins/<name>` resolves correctly. Claude uses a self-contained
@@ -114,12 +173,16 @@ contain native manifests and a projected `.mcp.json` when portable `mcp.json`
 is present. Register a non-default marketplace with the vendor CLI when that
 client requires it.
 
+Project scope ignores a user/system-configured `agentHome` and uses the current
+project's `.agents` or `.claude` root. Supplying both CLI `--scope project` and
+CLI `--agent-home` is an explicit override and uses that CLI home.
+
 Portable manifests may contain only the required `$schema` and `name`. Native
 projections leave that canonical file unchanged and supply deterministic native
 defaults when metadata is absent: version `0.1.0`, description
 `Portable projection for <name>.`, and author `Unknown`.
 
-Remote Git sources require a full commit SHA:
+Remote Git sources require an effective full commit SHA. A CLI override is:
 
 ```bash
 ./bin/plugin-installer install engineering-starter \

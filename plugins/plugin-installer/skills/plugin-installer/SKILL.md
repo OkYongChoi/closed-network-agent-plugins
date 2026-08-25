@@ -5,10 +5,14 @@ description: List and install catalogued Agent Plugins from local paths, interna
 
 # Plugin Installer
 
-Prefer a local checkout or approved internal mirror. The source precedence is:
-`--source`, `AGENT_PLUGINS_SOURCE`, the checkout containing this skill, then the
-canonical repository URL. A remote source requires a full 40-character commit
-SHA unless `--allow-mutable-ref` is explicitly supplied.
+Prefer an approved internal mirror. Effective settings are resolved per field
+in this order: CLI, `AGENT_PLUGINS_SOURCE`/`AGENT_PLUGINS_REF`, user JSON config,
+system JSON config, the checkout containing this skill, then the pinned
+canonical fallback. User config is `~/.agents/config.json` on Linux/macOS and
+`%USERPROFILE%\.agents\config.json` on Windows. System config is
+`/etc/agent-tools/config.json` or `%ProgramData%\AgentTools\config.json`.
+A remote source requires a full 40-character commit SHA unless mutable refs are
+explicitly enabled by CLI or trusted config.
 
 ## List
 
@@ -20,9 +24,7 @@ python3 scripts/plugin_installer.py list --source /srv/mirrors/plugins
 
 ```bash
 python3 scripts/plugin_installer.py install engineering-starter \
-  --source /srv/mirrors/plugins \
-  --target portable \
-  --agent-home ~/.agents
+  --source /srv/mirrors/plugins
 ```
 
 For an internal Git server:
@@ -48,9 +50,29 @@ On Windows use `python` instead of `python3`; paths may be native Windows paths:
 
 ```powershell
 python scripts/plugin_installer.py install engineering-starter `
-  --source D:\approved-mirrors\plugins --target portable `
-  --agent-home (Join-Path $HOME ".agents")
+  --source D:\approved-mirrors\plugins
 ```
+
+With centrally deployed config, the normal command is simply:
+
+```bash
+python3 scripts/plugin_installer.py install engineering-starter
+```
+
+`target` defaults to `portable` and `scope` defaults to `user`. Inspect the
+resolved non-secret settings and per-field provenance with
+`effective-config`; URL userinfo, query values, and fragments are not printed:
+
+```bash
+python3 scripts/plugin_installer.py effective-config
+```
+
+Only JSON config is supported. Unknown keys, duplicate keys, empty values,
+wrong types, and invalid targets fail closed. The shared config may contain
+`skills`, `plugins`, and `agentHome`; plugin settings are `source`, `ref`,
+`allowMutableRef`, and `defaultTarget`. Config files must be real, singly-linked
+regular files. Project scope ignores config-derived `agentHome`; an explicit
+CLI `--agent-home` still wins when combined with `--scope project`.
 
 ## Runtime loading boundaries
 
