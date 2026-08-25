@@ -1385,16 +1385,20 @@ class ToolingTests(unittest.TestCase):
                 ).stdout.strip()
 
             old_ref = commit_payload("old")
+            unapproved_ref = commit_payload("unapproved")
             new_ref = commit_payload("new")
             subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True)
 
-            def publish(ref: str, sequence: int, *, rollback: bool = False) -> None:
+            def publish(
+                ref: str, sequence: int, *, rollback: bool = False,
+                source: str = "https://gitlab.company.local/ai/plugins.git",
+            ) -> None:
                 args = argparse.Namespace(
                     push_url_env="TEST_PLUGIN_PUSH_URL",
                     ref=ref,
                     rollback=rollback,
                     sequence=sequence,
-                    source="https://gitlab.company.local/ai/plugins.git",
+                    source=source,
                     version=f"approved-{sequence}",
                     updated_at=f"2026-08-25T00:00:{sequence % 60:02d}Z",
                     git_name="Test Bot",
@@ -1403,6 +1407,10 @@ class ToolingTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"TEST_PLUGIN_PUSH_URL": str(remote)}):
                     release_promoter.publish(args)
 
+            publish(
+                old_ref, 10,
+                source="https://github.example/ai/plugins.git",
+            )
             publish(new_ref, 20)
             publish(old_ref, 10)
             manifest = json.loads(subprocess.run(
@@ -1412,13 +1420,23 @@ class ToolingTests(unittest.TestCase):
             self.assertEqual(manifest["ref"], new_ref)
             self.assertEqual(manifest["sequence"], 20)
 
-            publish(old_ref, 30, rollback=True)
+            with self.assertRaisesRegex(release_promoter.PromoteError, "approval history"):
+                publish(unapproved_ref, 30, rollback=True)
+            publish(old_ref, 5, rollback=True)
+            publish(new_ref, 20)
             rolled_back = json.loads(subprocess.run(
                 ["git", "--git-dir", str(remote), "show", "latest-approved:release-manifest.json"],
                 check=True, text=True, stdout=subprocess.PIPE,
             ).stdout)
             self.assertEqual(rolled_back["ref"], old_ref)
-            self.assertEqual(rolled_back["sequence"], 30)
+            self.assertEqual(rolled_back["sequence"], 21)
+
+    def test_gitlab_auto_publish_is_limited_to_default_branch_pushes(self):
+        pipeline = (ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"',
+            pipeline,
+        )
 
     def test_remote_source_requires_full_sha(self):
         with self.assertRaises(installer.InstallError):

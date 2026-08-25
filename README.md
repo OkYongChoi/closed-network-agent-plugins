@@ -210,7 +210,7 @@ tag. Catalog SHA-256 verification still applies.
 
 ## GitLab approval publishing and rollback
 
-Merging to the default branch is the approval event. The included GitLab CI
+Merging to the protected default branch is the approval event. The included GitLab CI
 pipeline validates Linux and Windows behavior, then serializes publication with
 `resource_group: latest-approved`. The publish job creates a manifest-only
 `latest-approved` branch containing the credential-free GitLab project source,
@@ -218,7 +218,8 @@ the immutable merge commit SHA, an `approved-<pipeline IID>` release version, th
 `catalog.json`, every approved plugin name and package digest, and the monotonic
 GitLab pipeline IID as `sequence`. If resource-group scheduling presents an
 older automatic pipeline after a newer one, the publisher compares `sequence`
-and skips the stale promotion.
+and skips the stale promotion. Scheduled, web, API, and manual pipelines do not
+automatically publish a release.
 
 The manifest is never a redirect to another repository. The configured source
 must match its source binding, and the payload is fetched from that same source
@@ -233,10 +234,15 @@ new pipeline, so publication does not loop. If policy disallows job-token push,
 use an equivalent protected internal bot credential for the job's Git remote;
 never store it in the manifest or logs.
 
+Protect the default branch as well: disable direct pushes while retaining merge
+permission for authorized Merge Request reviewers. This makes a default-branch
+`push` pipeline an MR merge result rather than an ad-hoc push.
+
 For rollback, start a default-branch pipeline with `ROLLBACK_REF` set to a
 previously approved full payload SHA and run the manual
-`rollback:latest-approved` job. Rollback is the only explicit bypass of the
-stale-sequence guard and is recorded as a new manifest commit. The next
+`rollback:latest-approved` job. The SHA must occur in the existing approval
+history. Rollback receives a sequence greater than the current pointer even if
+its job came from an older pipeline, and is recorded as a new manifest commit. The next
 `update engineering-starter` installs that earlier immutable snapshot. The
 manifest branch history remains the approval and rollback audit trail.
 
@@ -344,7 +350,7 @@ The vendored `repo-summary` source commit and tree digest are fixed in
 - Agent Plugins 1.0 specification and schemas: `ff8ab5e392cc87bd88d87c060815a87490e51003`
 - Vendored `repo-summary` source: `OkYongChoi/skills@ede183a13cc033d5a46ef42b6ad3e8d0a7e7530f`
 
-On 2026-08-25, strict repository validation, all 50 tests, and an offline
+On 2026-08-25, strict repository validation, all 51 tests, and an offline
 `core.autocrlf=true` clean-clone check passed. The corresponding
 [GitHub Actions run](https://github.com/OkYongChoi/plugins/actions/runs/32803068633)
 passed on Ubuntu and Windows, including native Windows launchers, hard links,

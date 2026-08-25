@@ -31,7 +31,7 @@ publish:latest-approved:
   rules:
     - if: '$ROLLBACK_REF'
       when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
   script:
     - python3 -B scripts/promote_release.py --source "${CI_PROJECT_URL}.git" --push-url-env CI_REPOSITORY_URL --ref "$CI_COMMIT_SHA" --version "approved-${CI_PIPELINE_IID}" --sequence "$CI_PIPELINE_IID"
 
