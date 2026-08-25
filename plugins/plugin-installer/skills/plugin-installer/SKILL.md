@@ -1,18 +1,22 @@
 ---
 name: plugin-installer
-description: List and install catalogued Agent Plugins from local paths, internal Git mirrors, or a full-SHA remote checkout with content-digest verification. Use for portable, Codex, or Claude installations in closed networks.
+description: List, install, and safely update approved Agent Plugins from local paths or internal Git mirrors with immutable-ref and content-digest verification. Use for portable, Codex, or Claude installations in closed networks.
 ---
 
 # Plugin Installer
 
 Prefer an approved internal mirror. Effective settings are resolved per field
 in this order: CLI, `AGENT_PLUGINS_SOURCE`/`AGENT_PLUGINS_REF`, user JSON config,
-system JSON config, the checkout containing this skill, then the pinned
-canonical fallback. User config is `~/.agents/config.json` on Linux/macOS and
+system JSON config, the checkout containing this skill, then the canonical
+source. User config is `~/.agents/config.json` on Linux/macOS and
 `%USERPROFILE%\.agents\config.json` on Windows. System config is
 `/etc/agent-tools/config.json` or `%ProgramData%\AgentTools\config.json`.
-A remote source requires a full 40-character commit SHA unless mutable refs are
-explicitly enabled by CLI or trusted config.
+When a central, environment, or CLI source has no explicit ref, the installer
+reads that repository's manifest-only `latest-approved` branch, validates its
+source binding and catalog/package digests, then fetches the payload by its
+recorded full SHA. An explicit ref must be a full 40-character SHA unless
+mutable refs are enabled for development. The embedded emergency fallback
+remains pinned.
 
 ## List
 
@@ -26,6 +30,21 @@ python3 scripts/plugin_installer.py list --source /srv/mirrors/plugins
 python3 scripts/plugin_installer.py install engineering-starter \
   --source /srv/mirrors/plugins
 ```
+
+## Update
+
+```bash
+python3 scripts/plugin_installer.py update engineering-starter
+```
+
+`update` compares the external installation-state sidecar with the approved
+release. It stages and validates the new projection, then replaces the plugin,
+vendor marketplace entry, and state under one lock. A catchable in-process
+publication failure restores the previous installation, marketplace, and
+state. An uncatchable process or host termination can leave hidden backups;
+rerun `update` when the target exists, otherwise stop for operator inspection
+and restoration. Canonical content is not mutated when a Codex or Claude
+projection is generated.
 
 For an internal Git server:
 
@@ -44,7 +63,7 @@ self-contained marketplace below
 `.claude-plugin/marketplace.json` and `plugins/`. Project scope uses equivalent
 roots below the current project. A Claude `--dest` must itself be named
 `plugins` and sit directly below the marketplace root. Existing installs are
-never overwritten.
+never overwritten by `install`; use `update` for a safe replacement.
 
 On Windows use `python` instead of `python3`; paths may be native Windows paths:
 

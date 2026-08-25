@@ -1,5 +1,6 @@
 stages:
   - validate
+  - publish
 
 variables:
   GIT_DEPTH: "0"
@@ -21,3 +22,27 @@ validate:windows:
     - python -B scripts/validate_repo.py
     - python -B -m unittest discover -s tests -v
     - python -B tests/platform_verify.py --autocrlf true
+
+publish:latest-approved:
+  stage: publish
+  tags:
+    - linux
+  resource_group: latest-approved
+  rules:
+    - if: '$ROLLBACK_REF'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - python3 -B scripts/promote_release.py --source "${CI_PROJECT_URL}.git" --push-url-env CI_REPOSITORY_URL --ref "$CI_COMMIT_SHA" --version "approved-${CI_PIPELINE_IID}" --sequence "$CI_PIPELINE_IID"
+
+rollback:latest-approved:
+  stage: publish
+  tags:
+    - linux
+  resource_group: latest-approved
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ROLLBACK_REF =~ /^[0-9a-fA-F]{40}$/'
+      when: manual
+    - when: never
+  script:
+    - python3 -B scripts/promote_release.py --source "${CI_PROJECT_URL}.git" --push-url-env CI_REPOSITORY_URL --ref "$ROLLBACK_REF" --version "rollback-${CI_PIPELINE_IID}" --sequence "$CI_PIPELINE_IID" --rollback

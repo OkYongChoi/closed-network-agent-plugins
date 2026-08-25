@@ -20,12 +20,14 @@ import tempfile
 import time
 import unicodedata
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 
 CANONICAL_SOURCE = "https://github.com/OkYongChoi/plugins.git"
+APPROVED_POINTER_REF = "refs/heads/latest-approved"
 CANONICAL_REF = "67a89145f3878ed277e1c8e86d73fc9f7d69edf0"
 PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 NAME_RE = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
@@ -59,6 +61,13 @@ MAX_CONFIG_BYTES = 64 * 1024
 CONFIG_TOP_LEVEL_KEYS = frozenset({"skills", "plugins", "agentHome"})
 CONFIG_REPOSITORY_KEYS = frozenset({"source", "ref", "allowMutableRef"})
 CONFIG_PLUGIN_KEYS = CONFIG_REPOSITORY_KEYS | {"defaultTarget"}
+RELEASE_MANIFEST_NAME = "release-manifest.json"
+RELEASE_MANIFEST_KEYS = frozenset({
+    "formatVersion", "kind", "name", "source", "ref", "version", "updatedAt",
+    "sequence", "catalogSha256", "packages",
+})
+RELEASE_PACKAGE_KEYS = frozenset({"name", "digest"})
+VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
 
 
 class InstallError(RuntimeError):
@@ -73,6 +82,23 @@ class EffectiveConfig(NamedTuple):
     agent_home: str | None
     scope: str
     provenance: dict[str, str]
+
+
+class ApprovedRelease(NamedTuple):
+    source: str
+    ref: str
+    version: str
+    updated_at: str
+    catalog_sha256: str
+    packages: dict[str, str]
+    sequence: int
+
+
+class InstallRecord(NamedTuple):
+    source: str
+    ref: str | None
+    digest: str
+    version: str | None
 
 
 def _portable_key(value: str) -> str:
@@ -238,6 +264,7 @@ class InstallLayout(NamedTuple):
     plugin_parent: Path
     destination: Path
     marketplace_path: Path | None
+    state_path: Path
     lock_path: Path
 
 
@@ -762,13 +789,11 @@ def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
         if configured_ref is not None:
             ref = configured_ref
         elif configured_source is not None:
-            # A selected local checkout remains valid without a ref. A selected
-            # remote never inherits the unrelated canonical repository's SHA;
-            # materialization will report that its own approved ref is missing.
+            # A centrally selected source without a fixed ref follows that
+            # repository's latest-approved pointer. The pointer itself is
+            # mutable; its payload ref is always an immutable full SHA.
             ref = None
-            provenance["ref"] = (
-                "local-source" if Path(source).expanduser().exists() else "unset"
-            )
+            provenance["ref"] = "approval-pointer"
         else:
             ref = CANONICAL_REF
             provenance["ref"] = "embedded-fallback"
@@ -878,6 +903,156 @@ def effective_config_payload(config: EffectiveConfig) -> dict[str, Any]:
     }
 
 
+def _source_identity(value: str) -> str:
+    """Return a credential-free identity suitable for release source binding."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value.rstrip("/\\")
+    if not parsed.scheme or not parsed.netloc:
+        return value.rstrip("/\\")
+    host = (parsed.hostname or "").casefold()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise InstallError("source contains an invalid port") from exc
+    if port is not None:
+        host = f"{host}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.casefold(), host, path, "", ""))
+
+
+def _manifest_source_for(source: str) -> str:
+    """Resolve a local Git mirror to its credential-free upstream identity."""
+    local = Path(source).expanduser()
+    if local.exists():
+        try:
+            origin = run_git(["-C", str(local.resolve(strict=True)), "remote", "get-url", "origin"])
+        except InstallError:
+            return str(local.resolve(strict=True))
+        return _source_identity(origin)
+    return _source_identity(source)
+
+
+def _local_has_approved_pointer(source: str) -> bool:
+    local = Path(source).expanduser()
+    if not local.exists():
+        return False
+    if (local / "HEAD").is_file() and (local / "objects").is_dir():
+        return True
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(local), "show-ref", "--verify", "--quiet",
+                APPROVED_POINTER_REF,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _load_release_manifest(path: Path) -> ApprovedRelease:
+    try:
+        raw = _read_config_bytes(path)
+        if raw is None:
+            raise InstallError(f"approved release manifest is missing: {path}")
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except InstallError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError(f"invalid approved release manifest {path}: {exc}") from exc
+    if not isinstance(data, dict) or set(data) != RELEASE_MANIFEST_KEYS:
+        raise InstallError("approved release manifest has unsupported or missing fields")
+    if data["formatVersion"] != 1 or data["kind"] != "agent-plugins-release" or data["name"] != "plugins":
+        raise InstallError("approved release manifest has an unsupported identity")
+    source = data["source"]
+    ref = data["ref"]
+    version = data["version"]
+    updated_at = data["updatedAt"]
+    catalog_sha = data["catalogSha256"]
+    sequence = data["sequence"]
+    if not _valid_config_string(source):
+        raise InstallError("approved release source must be a non-empty trimmed string")
+    try:
+        parsed_source = urlsplit(source)
+    except ValueError as exc:
+        raise InstallError("approved release source is invalid") from exc
+    if parsed_source.scheme and (
+        parsed_source.username is not None
+        or parsed_source.password is not None
+        or parsed_source.query
+        or parsed_source.fragment
+    ):
+        raise InstallError("approved release source must not contain credentials, query, or fragment")
+    if not isinstance(ref, str) or FULL_SHA_RE.fullmatch(ref) is None:
+        raise InstallError("approved release ref must be a full commit SHA")
+    if ref != ref.lower():
+        raise InstallError("approved release ref must use lowercase hexadecimal")
+    if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+        raise InstallError("approved release version is invalid")
+    if not isinstance(updated_at, str):
+        raise InstallError("approved release updatedAt must be a UTC timestamp")
+    try:
+        parsed_time = datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise InstallError("approved release updatedAt must use YYYY-MM-DDTHH:MM:SSZ") from exc
+    if parsed_time.strftime("%Y-%m-%dT%H:%M:%SZ") != updated_at:
+        raise InstallError("approved release updatedAt is not canonical")
+    if not isinstance(catalog_sha, str) or DIGEST_RE.fullmatch(catalog_sha) is None:
+        raise InstallError("approved release catalogSha256 is invalid")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise InstallError("approved release sequence must be a non-negative integer")
+    packages_raw = data["packages"]
+    if not isinstance(packages_raw, list) or not packages_raw:
+        raise InstallError("approved release packages must be a non-empty array")
+    packages: dict[str, str] = {}
+    portable_names: set[str] = set()
+    for item in packages_raw:
+        if not isinstance(item, dict) or set(item) != RELEASE_PACKAGE_KEYS:
+            raise InstallError("approved release package must contain only name and digest")
+        package_name, digest = item["name"], item["digest"]
+        if not isinstance(package_name, str) or NAME_RE.fullmatch(package_name) is None:
+            raise InstallError(f"invalid approved package name: {package_name!r}")
+        validate_portable_component(package_name, label="approved package name")
+        key = _portable_key(package_name)
+        if key in portable_names:
+            raise InstallError(f"duplicate approved package name: {package_name}")
+        portable_names.add(key)
+        if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+            raise InstallError(f"invalid approved package digest: {package_name}")
+        packages[package_name] = digest
+    return ApprovedRelease(source, ref, version, updated_at, catalog_sha, packages, sequence)
+
+
+@contextmanager
+def resolve_approved_release(source: str) -> Iterator[ApprovedRelease]:
+    """Read the mutable pointer, but trust only its immutable, source-bound payload."""
+    with tempfile.TemporaryDirectory(prefix="plugin-approved-pointer-") as temp_name:
+        root = Path(temp_name) / "pointer"
+        run_git(["init", "--quiet", str(root)])
+        run_git(["-C", str(root), "remote", "add", "origin", source])
+        run_git([
+            "-C", str(root), "fetch", "--quiet", "--depth=1", "origin", APPROVED_POINTER_REF,
+        ])
+        run_git(["-C", str(root), "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+        pointer_files = run_git(["-C", str(root), "ls-tree", "-r", "--name-only", "HEAD"]).splitlines()
+        if pointer_files != [RELEASE_MANIFEST_NAME]:
+            raise InstallError("latest-approved must contain only release-manifest.json")
+        manifest = _load_release_manifest(root / RELEASE_MANIFEST_NAME)
+        expected_source = _manifest_source_for(source)
+        if _source_identity(manifest.source) != expected_source:
+            raise InstallError(
+                "approved release source does not match the configured repository"
+            )
+        yield manifest
+
+
 def discover_checkout() -> Path | None:
     here = Path(__file__).resolve()
     for parent in here.parents:
@@ -941,6 +1116,32 @@ def materialize_source(source: str, ref: str | None, allow_mutable: bool) -> Ite
         yield root, actual_ref
 
 
+@contextmanager
+def materialize_effective_source(
+    effective: EffectiveConfig,
+) -> Iterator[tuple[Path, str | None, ApprovedRelease | None]]:
+    """Resolve either an explicit snapshot, embedded checkout, or approved pointer."""
+    local_without_pointer = (
+        Path(effective.source).expanduser().exists()
+        and not _local_has_approved_pointer(effective.source)
+    )
+    if (
+        effective.ref is not None
+        or effective.provenance.get("ref") == "current-checkout"
+        or local_without_pointer
+    ):
+        with materialize_source(
+            effective.source, effective.ref, effective.allow_mutable_ref
+        ) as (root, actual_ref):
+            yield root, actual_ref, None
+        return
+    with resolve_approved_release(effective.source) as release:
+        with materialize_source(effective.source, release.ref, False) as (root, actual_ref):
+            if actual_ref is None or actual_ref.lower() != release.ref:
+                raise InstallError("approved release did not resolve to its immutable ref")
+            yield root, actual_ref, release
+
+
 def _real_catalog_path(root: Path, relative: str, name: str) -> Path:
     if not relative or relative.startswith("/") or "\\" in relative:
         raise InstallError(f"unsafe catalog path for {name}: {relative!r}")
@@ -1000,6 +1201,23 @@ def read_catalog(root: Path) -> list[dict[str, str]]:
             raise InstallError(f"invalid content digest for {name}")
         result.append({"name": name, "path": relative, "content_sha256": digest})
     return result
+
+
+def verify_release_catalog(
+    root: Path, entries: list[dict[str, str]], release: ApprovedRelease
+) -> None:
+    try:
+        actual_catalog = hashlib.sha256((root / "catalog.json").read_bytes()).hexdigest()
+    except OSError as exc:
+        raise InstallError(f"cannot hash approved catalog: {exc}") from exc
+    if actual_catalog != release.catalog_sha256:
+        raise InstallError(
+            f"approved catalog digest mismatch: expected {release.catalog_sha256}, "
+            f"got {actual_catalog}"
+        )
+    catalog_packages = {entry["name"]: entry["content_sha256"] for entry in entries}
+    if catalog_packages != release.packages:
+        raise InstallError("approved release package digests do not match catalog.json")
 
 
 def select_entry(entries: list[dict[str, str]], name: str) -> dict[str, str]:
@@ -1142,7 +1360,9 @@ def project_plugin(source: Path, loaded: LoadedPlugin, target: str, output: Path
         raise InstallError(f"unsupported target: {target}")
 
 
-def marketplace_value(path: Path, target: str, manifest: dict[str, Any]) -> dict[str, Any]:
+def marketplace_value(
+    path: Path, target: str, manifest: dict[str, Any], *, replace_existing: bool = False
+) -> dict[str, Any]:
     name = manifest["name"]
     if os.path.lexists(path):
         path_stat = path.lstat()
@@ -1160,23 +1380,33 @@ def marketplace_value(path: Path, target: str, manifest: dict[str, Any]) -> dict
             "metadata": {"description": "Local projections installed from portable Agent Plugins."},
             "plugins": [],
         }
-    if any(isinstance(item, dict) and item.get("name") == name for item in value["plugins"]):
+    matches = [
+        index for index, item in enumerate(value["plugins"])
+        if isinstance(item, dict) and item.get("name") == name
+    ]
+    if len(matches) > 1:
+        raise InstallError(f"marketplace contains duplicate entries for {name}")
+    if matches and not replace_existing:
         raise InstallError(f"marketplace already contains {name}")
     if target == "codex":
-        value["plugins"].append({
+        entry = {
             "name": name,
             "source": {"source": "local", "path": f"./plugins/{name}"},
             "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
             "category": "Developer Tools",
-        })
+        }
     else:
         native = _native_manifest(manifest)
-        value["plugins"].append({
+        entry = {
             "name": name,
             "source": f"./plugins/{name}",
             "description": native["description"],
             "version": native["version"],
-        })
+        }
+    if matches:
+        value["plugins"][matches[0]] = entry
+    else:
+        value["plugins"].append(entry)
     return value
 
 
@@ -1191,7 +1421,10 @@ def _layout(args: argparse.Namespace, name: str) -> InstallLayout:
     explicit_parent = Path(args.dest).expanduser().resolve() if args.dest else None
     if args.target == "portable":
         parent = explicit_parent or agent_home / "plugins"
-        return InstallLayout(parent, parent / name, None, parent / f".{name}.install.lock")
+        return InstallLayout(
+            parent, parent / name, None, parent / f".{name}.install-state.json",
+            parent / f".{name}.install.lock",
+        )
     if args.target == "codex":
         # Codex resolves ./plugins/name in ~/.agents/plugins/marketplace.json to ~/plugins/name.
         expected_parent = agent_home.parent / "plugins"
@@ -1199,14 +1432,20 @@ def _layout(args: argparse.Namespace, name: str) -> InstallLayout:
             raise InstallError(f"Codex --dest must be {expected_parent} for marketplace path semantics")
         parent = expected_parent
         marketplace = agent_home / "plugins" / "marketplace.json"
-        return InstallLayout(parent, parent / name, marketplace, marketplace.parent / ".marketplace.install.lock")
+        return InstallLayout(
+            parent, parent / name, marketplace, parent / f".{name}.install-state.json",
+            marketplace.parent / ".marketplace.install.lock",
+        )
     # Claude marketplaces are self-contained roots with .claude-plugin/ and plugins/ siblings.
     if explicit_parent is not None and explicit_parent.name != "plugins":
         raise InstallError("Claude --dest must name the plugins/ directory directly below a marketplace root")
     marketplace_root = explicit_parent.parent if explicit_parent else agent_home / "plugins/marketplaces/okyongchoi-portable"
     parent = explicit_parent or marketplace_root / "plugins"
     marketplace = marketplace_root / ".claude-plugin" / "marketplace.json"
-    return InstallLayout(parent, parent / name, marketplace, marketplace_root / ".marketplace.install.lock")
+    return InstallLayout(
+        parent, parent / name, marketplace, parent / f".{name}.install-state.json",
+        marketplace_root / ".marketplace.install.lock",
+    )
 
 
 def _windows_exit_code_is_alive(exit_code: int | None) -> bool:
@@ -1451,7 +1690,102 @@ def install_lock(lock: Path) -> Iterator[None]:
     raise InstallError(f"could not acquire install lock after stale-lock recovery: {lock}")
 
 
-def install(source_plugin: Path, loaded: LoadedPlugin, args: argparse.Namespace) -> Path:
+def _install_state_payload(
+    manifest: dict[str, Any], args: argparse.Namespace, record: InstallRecord,
+    installed_digest: str,
+) -> dict[str, Any]:
+    return {
+        "formatVersion": 1,
+        "name": manifest["name"],
+        "source": _redact_source(record.source),
+        "ref": record.ref,
+        "digest": record.digest,
+        "installedDigest": installed_digest,
+        "version": record.version,
+        "target": args.target,
+        "installedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _read_install_state(path: Path) -> dict[str, Any] | None:
+    raw = _read_config_bytes(path)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError(f"invalid installation state {path}: {exc}") from exc
+    required = {
+        "formatVersion", "name", "source", "ref", "digest", "installedDigest",
+        "version", "target", "installedAt",
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("formatVersion") != 1:
+        raise InstallError(f"invalid installation state schema: {path}")
+    if (
+        not isinstance(value.get("name"), str)
+        or not isinstance(value.get("source"), str)
+        or (value.get("ref") is not None and not isinstance(value.get("ref"), str))
+        or not isinstance(value.get("digest"), str)
+        or not isinstance(value.get("installedDigest"), str)
+        or (value.get("version") is not None and not isinstance(value.get("version"), str))
+        or value.get("target") not in {"portable", "codex", "claude"}
+        or not isinstance(value.get("installedAt"), str)
+    ):
+        raise InstallError(f"invalid installation state values: {path}")
+    if (
+        DIGEST_RE.fullmatch(value["digest"]) is None
+        or DIGEST_RE.fullmatch(value["installedDigest"]) is None
+    ):
+        raise InstallError(f"invalid installation state digest: {path}")
+    return value
+
+
+def _state_matches(
+    state: dict[str, Any] | None, name: str, args: argparse.Namespace, record: InstallRecord
+) -> bool:
+    return bool(state) and all((
+        state.get("name") == name,
+        state.get("source") == _redact_source(record.source),
+        state.get("ref") == record.ref,
+        state.get("digest") == record.digest,
+        state.get("version") == record.version,
+        state.get("target") == args.target,
+    ))
+
+
+def _temporary_json(path: Path, value: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _remove_transaction_path(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _publish_installation(
+    source_plugin: Path,
+    loaded: LoadedPlugin,
+    args: argparse.Namespace,
+    record: InstallRecord | None,
+    *,
+    replace_existing: bool,
+) -> Path:
     manifest = loaded.manifest
     layout = _layout(args, manifest["name"])
     parent, destination = layout.plugin_parent, layout.destination
@@ -1460,47 +1794,209 @@ def install(source_plugin: Path, loaded: LoadedPlugin, args: argparse.Namespace)
     parent.mkdir(parents=True, exist_ok=True)
     layout.lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = layout.lock_path
-    installed = False
-    marketplace_tmp: Path | None = None
+    temporary_files: list[Path] = []
     temp_root: Path | None = None
     with install_lock(lock):
-        try:
-            if os.path.lexists(destination):
+        destination_exists = os.path.lexists(destination)
+        if destination_exists:
+            destination_stat = destination.lstat()
+            if (
+                destination.is_symlink()
+                or _is_reparse(destination_stat)
+                or not stat.S_ISDIR(destination_stat.st_mode)
+            ):
+                raise InstallError(f"installed plugin must be a real directory: {destination}")
+        if destination_exists != replace_existing:
+            if destination_exists:
                 raise InstallError(f"destination already exists: {destination}")
+            raise InstallError(f"plugin is not installed: {destination}")
+        try:
             temp_root = Path(tempfile.mkdtemp(prefix=f".{manifest['name']}.", dir=parent))
             staged = temp_root / manifest["name"]
             project_plugin(source_plugin, loaded, args.target, staged)
             validate_projection(staged, manifest["name"], args.target)
+            installed_digest = tree_digest(staged)
             marketplace = layout.marketplace_path
-            marketplace_data = marketplace_value(marketplace, args.target, manifest) if marketplace else None
-            os.replace(staged, destination)
-            installed = True
-            if marketplace and marketplace_data is not None:
-                marketplace.parent.mkdir(parents=True, exist_ok=True)
-                descriptor, temp_name = tempfile.mkstemp(
-                    prefix=f".{marketplace.name}.", suffix=".tmp", dir=marketplace.parent
+            marketplace_data = (
+                marketplace_value(
+                    marketplace, args.target, manifest, replace_existing=replace_existing
+                ) if marketplace else None
+            )
+            marketplace_tmp = (
+                _temporary_json(marketplace, marketplace_data)
+                if marketplace is not None and marketplace_data is not None else None
+            )
+            if marketplace_tmp is not None:
+                temporary_files.append(marketplace_tmp)
+            state_tmp = (
+                _temporary_json(
+                    layout.state_path,
+                    _install_state_payload(manifest, args, record, installed_digest),
                 )
-                marketplace_tmp = Path(temp_name)
-                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                    json.dump(marketplace_data, handle, indent=2, ensure_ascii=False)
-                    handle.write("\n")
-                os.replace(marketplace_tmp, marketplace)
-                marketplace_tmp = None
+                if record is not None else None
+            )
+            if state_tmp is not None:
+                temporary_files.append(state_tmp)
+
+            token = secrets.token_hex(8)
+            backup_destination = parent / f".{manifest['name']}.backup-{token}"
+            backup_marketplace = (
+                marketplace.with_name(f".{marketplace.name}.backup-{token}") if marketplace else None
+            )
+            backup_state = layout.state_path.with_name(
+                f".{layout.state_path.name}.backup-{token}"
+            )
+            marketplace_existed = (
+                marketplace is not None and os.path.lexists(marketplace)
+            )
+            state_existed = os.path.lexists(layout.state_path)
+            moved_destination = False
+            moved_marketplace = False
+            moved_state = False
+            published_destination = False
+            published_marketplace = False
+            published_state = False
+            try:
+                if replace_existing:
+                    os.replace(destination, backup_destination)
+                    moved_destination = True
+                if marketplace_existed:
+                    os.replace(marketplace, backup_marketplace)
+                    moved_marketplace = True
+                if state_existed:
+                    os.replace(layout.state_path, backup_state)
+                    moved_state = True
+                os.replace(staged, destination)
+                published_destination = True
+                if marketplace is not None and marketplace_tmp is not None:
+                    os.replace(marketplace_tmp, marketplace)
+                    temporary_files.remove(marketplace_tmp)
+                    published_marketplace = True
+                if state_tmp is not None:
+                    os.replace(state_tmp, layout.state_path)
+                    temporary_files.remove(state_tmp)
+                    published_state = True
+            # Restore on all catchable in-process failures, including
+            # KeyboardInterrupt/SystemExit. Filesystem state, rather than the
+            # post-syscall flags alone, handles an interrupt immediately after
+            # a successful rename.
+            except BaseException as publish_error:
+                rollback_errors: list[str] = []
+                recovery = (
+                    (
+                        layout.state_path,
+                        backup_state,
+                        state_tmp,
+                        state_existed,
+                    ),
+                    (
+                        marketplace,
+                        backup_marketplace,
+                        marketplace_tmp,
+                        marketplace_existed,
+                    ),
+                    (
+                        destination,
+                        backup_destination,
+                        staged,
+                        destination_exists,
+                    ),
+                )
+                for original, backup, staged_path, existed_before in recovery:
+                    if original is None or backup is None:
+                        continue
+                    try:
+                        if os.path.lexists(backup):
+                            if os.path.lexists(original):
+                                _remove_transaction_path(original)
+                            os.replace(backup, original)
+                        elif (
+                            not existed_before
+                            and staged_path is not None
+                            and not os.path.lexists(staged_path)
+                            and os.path.lexists(original)
+                        ):
+                            _remove_transaction_path(original)
+                    except OSError as exc:
+                        rollback_errors.append(str(exc))
+                if rollback_errors:
+                    raise InstallError(
+                        "installation failed and rollback was incomplete: "
+                        + "; ".join(rollback_errors)
+                    ) from publish_error
+                raise
+            if moved_destination:
+                shutil.rmtree(backup_destination, ignore_errors=True)
+            if moved_marketplace and backup_marketplace is not None:
+                try:
+                    backup_marketplace.unlink()
+                except OSError:
+                    pass
+            if moved_state:
+                try:
+                    backup_state.unlink()
+                except OSError:
+                    pass
             shutil.rmtree(temp_root, ignore_errors=True)
             temp_root = None
             return destination
-        except Exception:
-            if installed and destination.exists():
-                shutil.rmtree(destination, ignore_errors=True)
-            raise
         finally:
-            if marketplace_tmp is not None:
+            for temporary in temporary_files:
                 try:
-                    marketplace_tmp.unlink()
+                    temporary.unlink()
                 except FileNotFoundError:
                     pass
             if temp_root is not None:
                 shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def install(
+    source_plugin: Path,
+    loaded: LoadedPlugin,
+    args: argparse.Namespace,
+    record: InstallRecord | None = None,
+) -> Path:
+    return _publish_installation(
+        source_plugin, loaded, args, record, replace_existing=False
+    )
+
+
+def update_installation(
+    source_plugin: Path,
+    loaded: LoadedPlugin,
+    args: argparse.Namespace,
+    record: InstallRecord,
+) -> tuple[Path, bool]:
+    layout = _layout(args, loaded.manifest["name"])
+    if not os.path.lexists(layout.destination):
+        raise InstallError(
+            f"plugin is not installed; run install first: {layout.destination}"
+        )
+    state = _read_install_state(layout.state_path)
+    if _state_matches(state, loaded.manifest["name"], args, record):
+        validate_projection(layout.destination, loaded.manifest["name"], args.target)
+        marketplace_current = True
+        if layout.marketplace_path is not None:
+            marketplace_current = False
+            if os.path.lexists(layout.marketplace_path):
+                expected_marketplace = marketplace_value(
+                    layout.marketplace_path,
+                    args.target,
+                    loaded.manifest,
+                    replace_existing=True,
+                )
+                marketplace_current = (
+                    load_json(layout.marketplace_path) == expected_marketplace
+                )
+        if (
+            tree_digest(layout.destination) == state.get("installedDigest")
+            and marketplace_current
+        ):
+            return layout.destination, False
+    destination = _publish_installation(
+        source_plugin, loaded, args, record, replace_existing=True
+    )
+    return destination, True
 
 
 def validate_projection(root: Path, name: str, target: str) -> None:
@@ -1533,12 +2029,16 @@ def parser() -> argparse.ArgumentParser:
     mutable.add_argument("--allow-mutable-ref", action="store_true", default=None)
     mutable.add_argument("--no-allow-mutable-ref", action="store_false", dest="allow_mutable_ref")
     sub.add_parser("list", parents=[common], help="list catalogued plugins")
-    install_parser = sub.add_parser("install", parents=[common], help="install a catalogued plugin")
-    install_parser.add_argument("name")
-    install_parser.add_argument("--target", choices=("portable", "codex", "claude"))
-    install_parser.add_argument("--agent-home")
-    install_parser.add_argument("--scope", choices=("user", "project"))
-    install_parser.add_argument("--dest", help="override the destination plugin parent")
+    for command, help_text in (
+        ("install", "install a catalogued plugin"),
+        ("update", "safely update an installed plugin to the approved release"),
+    ):
+        command_parser = sub.add_parser(command, parents=[common], help=help_text)
+        command_parser.add_argument("name")
+        command_parser.add_argument("--target", choices=("portable", "codex", "claude"))
+        command_parser.add_argument("--agent-home")
+        command_parser.add_argument("--scope", choices=("user", "project"))
+        command_parser.add_argument("--dest", help="override the destination plugin parent")
     config_parser = sub.add_parser(
         "effective-config", parents=[common], help="print resolved settings and their provenance"
     )
@@ -1558,10 +2058,10 @@ def main(argv: list[str] | None = None) -> int:
         args.target = effective.target
         args.agent_home = effective.agent_home
         args.scope = effective.scope
-        with materialize_source(
-            effective.source, effective.ref, effective.allow_mutable_ref
-        ) as (root, actual_ref):
+        with materialize_effective_source(effective) as (root, actual_ref, release):
             entries = read_catalog(root)
+            if release is not None:
+                verify_release_catalog(root, entries, release)
             if args.command == "list":
                 for entry in entries:
                     print(f"{entry['name']}\t{entry['content_sha256']}\t{entry['path']}")
@@ -1570,9 +2070,26 @@ def main(argv: list[str] | None = None) -> int:
                 with verify_entry(root, entry) as (plugin_root, loaded):
                     for warning in loaded.warnings:
                         print(f"warning: {warning}", file=sys.stderr)
-                    destination = install(plugin_root, loaded, args)
+                    record = InstallRecord(
+                        effective.source,
+                        actual_ref,
+                        entry["content_sha256"],
+                        release.version if release is not None else None,
+                    )
+                    if args.command == "update":
+                        destination, changed = update_installation(
+                            plugin_root, loaded, args, record
+                        )
+                    else:
+                        destination = install(plugin_root, loaded, args, record)
+                        changed = True
                     revision = actual_ref or "local checkout"
-                    print(f"installed {loaded.manifest['name']} from {revision} to {destination}")
+                    action = "updated" if args.command == "update" and changed else (
+                        "already current" if args.command == "update" else "installed"
+                    )
+                    print(
+                        f"{action} {loaded.manifest['name']} from {revision} to {destination}"
+                    )
         return 0
     except (InstallError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

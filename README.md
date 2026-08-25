@@ -11,7 +11,7 @@ Python 3.11+ on Linux and Windows.
 | Plugin | Purpose |
 | --- | --- |
 | `plugin-creator` | Create a canonical plugin and optional isolated Codex/Claude projections. |
-| `plugin-installer` | Verify and atomically install catalogued plugins from a local mirror or pinned Git commit. |
+| `plugin-installer` | Install or update plugins from the latest approved release or a pinned Git commit. |
 | `engineering-starter` | Offline repository orientation; embeds `repo-summary` at build time. |
 
 Every canonical package has `plugins/<name>/plugin.json` and a `skills/`
@@ -60,10 +60,12 @@ $env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
 $env:AGENT_PLUGINS_REF = "67a89145f3878ed277e1c8e86d73fc9f7d69edf0"
 ```
 
-For normal managed use, deploy the JSON config described below rather than
-asking each user to export these variables. The final canonical fallback is
-pinned to a reviewed full commit SHA; it never resolves an implicit moving
-branch.
+For normal managed use, deploy only the approved GitLab source in JSON config.
+Users do not export or maintain refs. For a centrally configured source without
+a ref, the installer reads the manifest-only `latest-approved` branch, extracts
+its full commit SHA, and fetches that immutable payload. A complete embedded
+checkout remains usable without Git or a ref, and the public emergency fallback
+remains pinned rather than depending on a mutable pointer.
 
 ## Central effective config
 
@@ -76,7 +78,7 @@ The installer resolves each field independently, with this precedence:
 4. system config: `/etc/agent-tools/config.json` on Linux or
    `%ProgramData%\AgentTools\config.json` on Windows
 5. the checkout containing the running installer
-6. the embedded canonical source and approved full commit SHA
+6. the embedded canonical source and pinned emergency fallback SHA
 
 Only JSON is accepted. A shared Skills/Plugins configuration looks like:
 
@@ -89,7 +91,6 @@ Only JSON is accepted. A shared Skills/Plugins configuration looks like:
   },
   "plugins": {
     "source": "https://gitlab.company.local/ai/plugins.git",
-    "ref": "abcdef0123456789abcdef0123456789abcdef01",
     "allowMutableRef": false,
     "defaultTarget": "portable"
   },
@@ -98,12 +99,14 @@ Only JSON is accepted. A shared Skills/Plugins configuration looks like:
 ```
 
 Unknown or duplicate keys, wrong types, empty source/ref values, invalid
-targets, and a non-full ref without `allowMutableRef: true` fail closed. Branch
-and tag refs remain an explicit development-only exception. An installed copy
-that is not inside a repository uses the embedded pinned fallback; an installer
-running from a complete local checkout continues to use that checkout without
-a ref. A configured remote source without its own ref does not inherit the
-canonical repository's SHA and fails with a missing-ref error. Config files
+targets, and a non-full explicit ref without `allowMutableRef: true` fail
+closed. Branch and tag refs remain an explicit development-only exception. An
+installer running from a complete local checkout uses that embedded checkout
+without a ref. A configured remote source, or a local Git mirror that contains
+`refs/heads/latest-approved`, resolves that pointer, validates its strict release
+manifest and source binding, then checks out only the full SHA recorded there.
+An ordinary local working checkout without that ref remains a direct development
+source for backward compatibility. Config files
 must be real, singly-linked regular files; symlinks, hard links, and Windows
 reparse points are rejected.
 
@@ -153,7 +156,17 @@ Import a skill from a pinned internal Git source:
 ./bin/plugin-installer list
 
 ./bin/plugin-installer install engineering-starter
+
+./bin/plugin-installer update engineering-starter
 ```
+
+`list` and `install` use the approved catalog. `update` compares an external
+installation-state sidecar with the approved source, ref, release version, and
+package digest. An unchanged installation is reported as current. A changed
+portable, Codex, or Claude installation is projected and validated in staging
+before the plugin directory, marketplace entry, and state are replaced as one
+rollback-protected transaction. A legacy installation without a sidecar can be
+updated once and then participates in normal comparisons.
 
 Targets are `portable`, `codex`, or `claude`; central config can select one and
 the default is `portable`. Scope defaults to `user`. Portable user installs
@@ -182,7 +195,8 @@ projections leave that canonical file unchanged and supply deterministic native
 defaults when metadata is absent: version `0.1.0`, description
 `Portable projection for <name>.`, and author `Unknown`.
 
-Remote Git sources require an effective full commit SHA. A CLI override is:
+An explicit ref overrides `latest-approved` and must be a full commit SHA. This
+is useful for audit reproduction or development diagnostics:
 
 ```bash
 ./bin/plugin-installer install engineering-starter \
@@ -194,14 +208,51 @@ Remote Git sources require an effective full commit SHA. A CLI override is:
 `--allow-mutable-ref` is an explicit development escape hatch for a branch or
 tag. Catalog SHA-256 verification still applies.
 
+## GitLab approval publishing and rollback
+
+Merging to the default branch is the approval event. The included GitLab CI
+pipeline validates Linux and Windows behavior, then serializes publication with
+`resource_group: latest-approved`. The publish job creates a manifest-only
+`latest-approved` branch containing the credential-free GitLab project source,
+the immutable merge commit SHA, an `approved-<pipeline IID>` release version, the SHA-256 of
+`catalog.json`, every approved plugin name and package digest, and the monotonic
+GitLab pipeline IID as `sequence`. If resource-group scheduling presents an
+older automatic pipeline after a newer one, the publisher compares `sequence`
+and skips the stale promotion.
+
+The manifest is never a redirect to another repository. The configured source
+must match its source binding, and the payload is fetched from that same source
+by full SHA. A local bare mirror works when it includes `latest-approved` and
+its `origin` identifies the approved GitLab project.
+
+For same-project CI publishing, enable **Settings > CI/CD > Job token
+permissions > Allow Git push requests to the repository**. It is disabled by
+default. Protect `latest-approved` and allow the CI job token's triggering role
+to push; normal users should not update it. A job-token push does not trigger a
+new pipeline, so publication does not loop. If policy disallows job-token push,
+use an equivalent protected internal bot credential for the job's Git remote;
+never store it in the manifest or logs.
+
+For rollback, start a default-branch pipeline with `ROLLBACK_REF` set to a
+previously approved full payload SHA and run the manual
+`rollback:latest-approved` job. Rollback is the only explicit bypass of the
+stale-sequence guard and is recorded as a new manifest commit. The next
+`update engineering-starter` installs that earlier immutable snapshot. The
+manifest branch history remains the approval and rollback audit trail.
+
 ## Safety model
 
 Before installation, the installer verifies the catalog digest and rejects
 absolute/traversing catalog paths, symlinks, hard links, case-colliding paths,
 non-regular files, and trees over 2,000 files or 50 MiB. It stages on the
 destination filesystem, uses an exclusive lock, atomically renames the staged
-plugin, and does not overwrite an existing installation. Marketplace failures
-are checked before the plugin becomes visible and trigger rollback. Vendor
+plugin, and does not overwrite an existing installation during `install`.
+`update` backs up the prior plugin, marketplace, and external state sidecar
+under the same lock and restores all three after a catchable in-process
+publication failure, including `KeyboardInterrupt`. An uncatchable process or
+host termination can leave hidden transaction backups because these separate
+paths cannot be committed by one rename; rerun `update` when the target exists,
+otherwise stop for operator inspection and restoration. Vendor
 marketplace read-modify-write operations share one marketplace-wide lock across
 all plugin names.
 

@@ -34,6 +34,7 @@ def load(name: str, path: Path):
 
 creator = load("creator", ROOT / "plugins/plugin-creator/skills/plugin-creator/scripts/create_plugin.py")
 installer = load("installer", ROOT / "plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py")
+release_promoter = load("release_promoter", ROOT / "scripts/promote_release.py")
 repo_summary = load(
     "repo_summary",
     ROOT / "plugins/engineering-starter/skills/repo-summary/scripts/repo_summary.py",
@@ -1036,7 +1037,7 @@ class ToolingTests(unittest.TestCase):
                 local = installer.resolve_effective_config(local_args)
             self.assertEqual(Path(local.source), ROOT)
             self.assertIsNone(local.ref)
-            self.assertEqual(local.provenance["ref"], "local-source")
+            self.assertEqual(local.provenance["ref"], "approval-pointer")
 
             remote_args = installer.parser().parse_args([
                 "install", "engineering-starter",
@@ -1048,12 +1049,7 @@ class ToolingTests(unittest.TestCase):
             ):
                 remote = installer.resolve_effective_config(remote_args)
             self.assertIsNone(remote.ref)
-            self.assertEqual(remote.provenance["ref"], "unset")
-            with self.assertRaises(installer.InstallError):
-                with installer.materialize_source(
-                    remote.source, remote.ref, remote.allow_mutable_ref
-                ):
-                    pass
+            self.assertEqual(remote.provenance["ref"], "approval-pointer")
 
             with (
                 mock.patch.object(installer, "config_paths", return_value=(user_path, system_path)),
@@ -1063,6 +1059,7 @@ class ToolingTests(unittest.TestCase):
                 canonical = installer.resolve_effective_config(args)
             self.assertEqual(canonical.source, installer.CANONICAL_SOURCE)
             self.assertEqual(canonical.ref, installer.CANONICAL_REF)
+            self.assertEqual(canonical.provenance["ref"], "embedded-fallback")
 
     def test_effective_config_strict_json_and_ref_policy(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1158,6 +1155,270 @@ class ToolingTests(unittest.TestCase):
         self.assertIn("***@git.example", rendered)
         self.assertIn("REDACTED", rendered)
         self.assertEqual(installer._redact_source("https://git.example:invalid/repo"), "<invalid-url>")
+
+    def test_latest_approved_pointer_resolves_source_bound_immutable_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repository = Path(temp) / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "test@example.invalid"], check=True)
+            upstream = "https://gitlab.company.local/ai/plugins.git"
+            subprocess.run(["git", "-C", str(repository), "remote", "add", "origin", upstream], check=True)
+            (repository / "plugins").mkdir()
+            plugin = make_plugin(repository / "plugins", "approved-plugin", version="1.0.0")
+            digest = installer.tree_digest(plugin)
+            (repository / "catalog.json").write_text(json.dumps({
+                "format_version": 1,
+                "plugins": [{
+                    "name": "approved-plugin",
+                    "path": "plugins/approved-plugin",
+                    "content_sha256": digest,
+                }],
+            }, indent=2) + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "payload"], check=True)
+            payload_ref = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"], check=True,
+                text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            manifest = json.loads(release_promoter.manifest(
+                (repository / "catalog.json").read_bytes(), upstream, payload_ref,
+                "2026.08.25+test", "2026-08-25T00:00:00Z", 10,
+            ))
+            subprocess.run(["git", "-C", str(repository), "checkout", "-q", "--orphan", "latest-approved"], check=True)
+            subprocess.run(["git", "-C", str(repository), "rm", "-qrf", "."], check=True)
+            (repository / "release-manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(repository), "add", "release-manifest.json"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "approve"], check=True)
+
+            effective = installer.EffectiveConfig(
+                str(repository), None, False, "portable", str(Path(temp) / ".agents"),
+                "user", {"source": "system-config", "ref": "approval-pointer"},
+            )
+            with installer.materialize_effective_source(effective) as (root, actual, release):
+                self.assertEqual(actual, payload_ref)
+                self.assertEqual(release.ref, payload_ref)
+                entries = installer.read_catalog(root)
+                installer.verify_release_catalog(root, entries, release)
+                self.assertEqual(entries[0]["name"], "approved-plugin")
+            self.assertTrue(installer._local_has_approved_pointer(str(repository)))
+            self.assertFalse(installer._local_has_approved_pointer(str(ROOT)))
+            direct = installer.EffectiveConfig(
+                str(ROOT), None, False, "portable", str(Path(temp) / ".agents"),
+                "user", {"source": "cli", "ref": "local-source"},
+            )
+            with installer.materialize_effective_source(direct) as (
+                direct_root, direct_ref, direct_release
+            ):
+                self.assertEqual(direct_root, ROOT)
+                self.assertIsNone(direct_ref)
+                self.assertIsNone(direct_release)
+
+            bad = dict(manifest)
+            bad["source"] = "https://gitlab.company.local/ai/other.git"
+            (repository / "release-manifest.json").write_text(json.dumps(bad), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "release-manifest.json"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "bad binding"], check=True)
+            with self.assertRaisesRegex(installer.InstallError, "does not match"):
+                with installer.resolve_approved_release(str(repository)):
+                    pass
+
+    def test_update_is_atomic_and_preserves_marketplace_and_state_on_failure(self):
+        for target in ("portable", "codex", "claude"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "v1").mkdir()
+                source_v1 = make_plugin(root / "v1", "update-plugin", version="1.0.0")
+                (source_v1 / "payload.txt").write_text("old", encoding="utf-8")
+                loaded_v1 = installer.load_plugin(source_v1)
+                (root / "v2").mkdir()
+                source_v2 = make_plugin(root / "v2", "update-plugin", version="2.0.0")
+                (source_v2 / "payload.txt").write_text("new", encoding="utf-8")
+                loaded_v2 = installer.load_plugin(source_v2)
+                agent_home = root / (".claude" if target == "claude" else ".agents")
+                args = argparse.Namespace(
+                    dest=None, agent_home=str(agent_home), scope="user", target=target,
+                )
+                old_record = installer.InstallRecord(
+                    "https://gitlab.company.local/ai/plugins.git", "1" * 40,
+                    installer.tree_digest(source_v1), "2026.08.24+old",
+                )
+                new_record = installer.InstallRecord(
+                    "https://gitlab.company.local/ai/plugins.git", "2" * 40,
+                    installer.tree_digest(source_v2), "2026.08.25+new",
+                )
+                destination = installer.install(source_v1, loaded_v1, args, old_record)
+                layout = installer._layout(args, "update-plugin")
+                old_state = layout.state_path.read_bytes()
+                old_marketplace = (
+                    layout.marketplace_path.read_bytes() if layout.marketplace_path else None
+                )
+                actual_replace = installer.os.replace
+                # Fail last, after vendor marketplace publication, so rollback
+                # must restore the plugin, marketplace, and state together.
+                failure_target = layout.state_path
+
+                def fail_publication(source, target_path):
+                    if Path(target_path) == failure_target and str(source).endswith(".tmp"):
+                        actual_replace(source, target_path)
+                        raise KeyboardInterrupt()
+                    return actual_replace(source, target_path)
+
+                with mock.patch.object(installer.os, "replace", side_effect=fail_publication):
+                    with self.assertRaises(KeyboardInterrupt):
+                        installer.update_installation(source_v2, loaded_v2, args, new_record)
+                self.assertEqual((destination / "payload.txt").read_text(encoding="utf-8"), "old")
+                self.assertEqual(layout.state_path.read_bytes(), old_state)
+                if layout.marketplace_path:
+                    self.assertEqual(layout.marketplace_path.read_bytes(), old_marketplace)
+
+                updated, changed = installer.update_installation(
+                    source_v2, loaded_v2, args, new_record
+                )
+                self.assertTrue(changed)
+                self.assertEqual((updated / "payload.txt").read_text(encoding="utf-8"), "new")
+                if layout.marketplace_path:
+                    marketplace = json.loads(layout.marketplace_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        sum(item.get("name") == "update-plugin" for item in marketplace["plugins"]), 1
+                    )
+                same, changed = installer.update_installation(
+                    source_v2, loaded_v2, args, new_record
+                )
+                self.assertEqual(same, updated)
+                self.assertFalse(changed)
+                if layout.marketplace_path:
+                    layout.marketplace_path.unlink()
+                    repaired_marketplace, changed = installer.update_installation(
+                        source_v2, loaded_v2, args, new_record
+                    )
+                    self.assertTrue(changed)
+                    self.assertTrue(layout.marketplace_path.is_file())
+                    self.assertEqual(repaired_marketplace, updated)
+                (updated / "payload.txt").write_text("tampered", encoding="utf-8")
+                repaired, changed = installer.update_installation(
+                    source_v2, loaded_v2, args, new_record
+                )
+                self.assertTrue(changed)
+                self.assertEqual((repaired / "payload.txt").read_text(encoding="utf-8"), "new")
+
+    def test_release_manifest_rejects_mutable_ref_digest_drift_and_secrets(self):
+        base = {
+            "formatVersion": 1,
+            "kind": "agent-plugins-release",
+            "name": "plugins",
+            "source": "https://gitlab.company.local/ai/plugins.git",
+            "ref": "a" * 40,
+            "version": "2026.08.25+test",
+            "updatedAt": "2026-08-25T00:00:00Z",
+            "sequence": 10,
+            "catalogSha256": "b" * 64,
+            "packages": [{"name": "engineering-starter", "digest": "c" * 64}],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-manifest.json"
+            for field, bad_value in (
+                ("ref", "main"),
+                ("source", "https://user:secret@gitlab.company.local/ai/plugins.git"),
+                ("updatedAt", "2026-08-25"),
+            ):
+                with self.subTest(field=field):
+                    value = dict(base)
+                    value[field] = bad_value
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    with self.assertRaises(installer.InstallError):
+                        installer._load_release_manifest(path)
+            path.write_text(json.dumps(base), encoding="utf-8")
+            release = installer._load_release_manifest(path)
+            (Path(temp) / "catalog.json").write_text(
+                json.dumps({"format_version": 1, "plugins": []}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(installer.InstallError, "catalog digest mismatch"):
+                installer.verify_release_catalog(Path(temp), [], release)
+            path.write_bytes(b" " * (installer.MAX_CONFIG_BYTES + 1))
+            with self.assertRaisesRegex(installer.InstallError, "larger than"):
+                installer._load_release_manifest(path)
+            path.unlink()
+            real_manifest = Path(temp) / "real-manifest.json"
+            real_manifest.write_text(json.dumps(base), encoding="utf-8")
+            try:
+                path.symlink_to(real_manifest)
+            except OSError:
+                pass
+            else:
+                with self.assertRaisesRegex(installer.InstallError, "real regular file"):
+                    installer._load_release_manifest(path)
+
+    def test_promoter_skips_stale_pipeline_and_allows_explicit_rollback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            work = root / "work"
+            remote = root / "remote.git"
+            work.mkdir()
+            subprocess.run(["git", "init", "-q", str(work)], check=True)
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+            subprocess.run(["git", "-C", str(work), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(work), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
+            (work / "plugins").mkdir()
+            plugin = make_plugin(work / "plugins", "release-plugin", version="1.0.0")
+
+            def commit_payload(text: str) -> str:
+                (plugin / "payload.txt").write_text(text, encoding="utf-8")
+                digest = installer.tree_digest(plugin)
+                (work / "catalog.json").write_text(json.dumps({
+                    "format_version": 1,
+                    "plugins": [{
+                        "name": "release-plugin",
+                        "path": "plugins/release-plugin",
+                        "content_sha256": digest,
+                    }],
+                }) + "\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(work), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(work), "commit", "-qm", text], check=True)
+                return subprocess.run(
+                    ["git", "-C", str(work), "rev-parse", "HEAD"], check=True,
+                    text=True, stdout=subprocess.PIPE,
+                ).stdout.strip()
+
+            old_ref = commit_payload("old")
+            new_ref = commit_payload("new")
+            subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True)
+
+            def publish(ref: str, sequence: int, *, rollback: bool = False) -> None:
+                args = argparse.Namespace(
+                    push_url_env="TEST_PLUGIN_PUSH_URL",
+                    ref=ref,
+                    rollback=rollback,
+                    sequence=sequence,
+                    source="https://gitlab.company.local/ai/plugins.git",
+                    version=f"approved-{sequence}",
+                    updated_at=f"2026-08-25T00:00:{sequence % 60:02d}Z",
+                    git_name="Test Bot",
+                    git_email="test-bot@example.invalid",
+                )
+                with mock.patch.dict(os.environ, {"TEST_PLUGIN_PUSH_URL": str(remote)}):
+                    release_promoter.publish(args)
+
+            publish(new_ref, 20)
+            publish(old_ref, 10)
+            manifest = json.loads(subprocess.run(
+                ["git", "--git-dir", str(remote), "show", "latest-approved:release-manifest.json"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout)
+            self.assertEqual(manifest["ref"], new_ref)
+            self.assertEqual(manifest["sequence"], 20)
+
+            publish(old_ref, 30, rollback=True)
+            rolled_back = json.loads(subprocess.run(
+                ["git", "--git-dir", str(remote), "show", "latest-approved:release-manifest.json"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout)
+            self.assertEqual(rolled_back["ref"], old_ref)
+            self.assertEqual(rolled_back["sequence"], 30)
 
     def test_remote_source_requires_full_sha(self):
         with self.assertRaises(installer.InstallError):
