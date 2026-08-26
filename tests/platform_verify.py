@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         ])
         env = os.environ.copy()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        run([sys.executable, "-B", "scripts/refresh_catalog.py", "--check"], cwd=clone, env=env)
         run([sys.executable, "-B", "scripts/validate_repo.py"], cwd=clone, env=env)
         run(
             [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-v"],

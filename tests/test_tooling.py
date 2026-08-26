@@ -35,6 +35,7 @@ def load(name: str, path: Path):
 creator = load("creator", ROOT / "plugins/plugin-creator/skills/plugin-creator/scripts/create_plugin.py")
 installer = load("installer", ROOT / "plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py")
 release_promoter = load("release_promoter", ROOT / "scripts/promote_release.py")
+catalog_refresher = load("catalog_refresher", ROOT / "scripts/refresh_catalog.py")
 repo_summary = load(
     "repo_summary",
     ROOT / "plugins/engineering-starter/skills/repo-summary/scripts/repo_summary.py",
@@ -53,9 +54,49 @@ class ToolingTests(unittest.TestCase):
     def test_gitlab_uses_platform_python_commands(self):
         pipeline = (ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
         linux, windows = pipeline.split("validate:windows:", 1)
+        self.assertIn("python3 -B scripts/refresh_catalog.py --check", linux)
         self.assertIn("python3 -B scripts/validate_repo.py", linux)
         self.assertNotIn("python -B scripts/validate_repo.py", linux)
+        self.assertIn("python -B scripts/refresh_catalog.py --check", windows)
         self.assertIn("python -B scripts/validate_repo.py", windows)
+
+    def test_refresh_catalog_updates_digests_and_check_is_read_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plugins = root / "plugins"
+            plugins.mkdir()
+            second = make_plugin(plugins, "second-plugin")
+            first = make_plugin(plugins, "first-plugin")
+            (first / "payload.txt").write_text("first", encoding="utf-8")
+            (second / "payload.txt").write_text("second", encoding="utf-8")
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({
+                "format_version": 1,
+                "repository": "https://git.example.internal/plugins.git",
+                "plugins": [],
+            }), encoding="utf-8")
+
+            with mock.patch.object(catalog_refresher, "ROOT", root), mock.patch.object(
+                catalog_refresher, "CATALOG", catalog
+            ), mock.patch.object(catalog_refresher, "PLUGINS", plugins):
+                before = catalog.read_bytes()
+                self.assertEqual(catalog_refresher.main(["--check"]), 1)
+                self.assertEqual(catalog.read_bytes(), before)
+                self.assertEqual(catalog_refresher.main([]), 0)
+                self.assertEqual(catalog_refresher.main(["--check"]), 0)
+
+            refreshed = json.loads(catalog.read_text(encoding="utf-8"))
+            self.assertEqual(
+                refreshed["repository"], "https://git.example.internal/plugins.git"
+            )
+            self.assertEqual(
+                [item["name"] for item in refreshed["plugins"]],
+                ["first-plugin", "second-plugin"],
+            )
+            self.assertEqual(
+                refreshed["plugins"][0]["content_sha256"],
+                creator.tree_digest(first),
+            )
 
     @unittest.skipUnless(os.name == "nt", "Windows launchers require Windows")
     def test_windows_cmd_and_powershell_entrypoints(self):

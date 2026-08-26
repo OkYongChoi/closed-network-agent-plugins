@@ -7,8 +7,8 @@
     "name": "OkYongChoi",
     "url": "https://github.com/OkYongChoi"
   },
-  "homepage": "https://github.com/OkYongChoi/closed-network-agent-plugins",
-  "repository": "https://github.com/OkYongChoi/closed-network-agent-plugins",
+  "homepage": "https://github.com/OkYongChoi/air-gapped-agent-plugins",
+  "repository": "https://github.com/OkYongChoi/air-gapped-agent-plugins",
   "license": "Apache-2.0",
   "keywords": ["agent-plugins", "creator", "offline"]
 }

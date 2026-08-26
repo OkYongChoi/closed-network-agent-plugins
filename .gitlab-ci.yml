@@ -10,6 +10,7 @@ validate:linux:
   tags:
     - linux
   script:
+    - python3 -B scripts/refresh_catalog.py --check
     - python3 -B scripts/validate_repo.py
     - python3 -B -m unittest discover -s tests -v
     - python3 -B tests/platform_verify.py --autocrlf true
@@ -19,6 +20,7 @@ validate:windows:
   tags:
     - windows
   script:
+    - python -B scripts/refresh_catalog.py --check
     - python -B scripts/validate_repo.py
     - python -B -m unittest discover -s tests -v
     - python -B tests/platform_verify.py --autocrlf true
@@ -30,6 +32,7 @@ validate:macos:
   when: manual
   allow_failure: true
   script:
+    - python3 -B scripts/refresh_catalog.py --check
     - python3 -B scripts/validate_repo.py
     - python3 -B -m unittest discover -s tests -v
     - python3 -B tests/platform_verify.py --autocrlf true
