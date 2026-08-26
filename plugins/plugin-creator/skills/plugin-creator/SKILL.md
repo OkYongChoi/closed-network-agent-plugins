@@ -23,7 +23,7 @@ To import an existing Agent Skill, pin remote Git sources to a full commit SHA:
 ```bash
 python3 scripts/create_plugin.py create-plugin engineering-tools \
   --output ./plugins \
-  --import-skill https://git.example.internal/agents/closed-network-agent-skills.git \
+  --import-skill https://git.example.internal/agents/air-gapped-agent-skills.git \
   --ref 0123456789abcdef0123456789abcdef01234567 \
   --path skills/repo-summary
 ```

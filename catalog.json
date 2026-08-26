@@ -1,21 +1,21 @@
 {
   "format_version": 1,
-  "repository": "https://github.com/OkYongChoi/closed-network-agent-plugins.git",
+  "repository": "https://github.com/OkYongChoi/air-gapped-agent-plugins.git",
   "plugins": [
     {
       "name": "engineering-starter",
       "path": "plugins/engineering-starter",
-      "content_sha256": "ca1289d2e556ba19d2b9f6f262e7c0decc2136e9f6d26718884472f14621901d"
+      "content_sha256": "9bee1a9425998f3e995862ed316cc8a7b1b6b1df76a57aafd28cb904599534cd"
     },
     {
       "name": "plugin-creator",
       "path": "plugins/plugin-creator",
-      "content_sha256": "fd4d7f60dcf74e3125bf0e406e5e96a703e7fe1f776c22b8fad22af7ff811bf0"
+      "content_sha256": "23d18f0d421a4c6948f4ebdb5f273136b74251187932220cef70fdb23e09fd19"
     },
     {
       "name": "plugin-installer",
       "path": "plugins/plugin-installer",
-      "content_sha256": "033035aa5009ae61d7d0a6b685b3abe166f8227b28d31d0d688b0271b6101b12"
+      "content_sha256": "f4b8803203f6de3d7a23de008ef66a069e5fcf007583d2af4b80307fba746af0"
     }
   ]
 }
