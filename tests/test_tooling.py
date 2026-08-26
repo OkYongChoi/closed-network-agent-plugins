@@ -542,7 +542,10 @@ class ToolingTests(unittest.TestCase):
             target.mkdir()
             (target / "file").write_text("x")
             (root / "tree").mkdir()
-            (root / "tree/link").symlink_to(target / "file")
+            try:
+                (root / "tree/link").symlink_to(target / "file")
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
             with self.assertRaises(installer.InstallError):
                 installer.inspect_tree(root / "tree")
             (root / "catalog.json").write_text(json.dumps({
