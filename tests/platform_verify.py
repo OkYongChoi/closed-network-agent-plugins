@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline clean-clone verification for Linux and Windows runners."""
+"""Offline clean-clone verification for macOS, Linux, and Windows runners."""
 
 from __future__ import annotations
 

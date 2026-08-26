@@ -10,7 +10,7 @@ package; projections are disposable staging output.
 
 Creation stages canonical and adapter output on the selected output filesystem,
 then publishes it as one rollback-capable transaction. This supports Windows
-drive-letter layouts and Linux mounts without cross-filesystem rename failures.
+drive-letter layouts and POSIX (Linux/macOS) mounts without cross-filesystem rename failures.
 Any existing `.staging` path must be a real non-reparse directory that resolves
 inside the output root; symlinked or junction-backed staging roots are rejected.
 
@@ -43,7 +43,7 @@ cannot enter the package. Without `--ref`, provenance records a local snapshot
 with a null commit rather than claiming the current `HEAD` is authoritative.
 Portable names and paths reject Windows device aliases, ADS/reserved
 characters, trailing dots/spaces, non-NFC names, Unicode-normalized collisions,
-junctions/reparse points, and path-length violations on both Linux and Windows.
+junctions/reparse points, and path-length violations on Linux, macOS, and Windows.
 Git operations time out after 60 seconds.
 
 ## Validate

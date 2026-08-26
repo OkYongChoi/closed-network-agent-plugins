@@ -10,7 +10,8 @@ in this order: CLI, `AGENT_PLUGINS_SOURCE`/`AGENT_PLUGINS_REF`, user JSON config
 system JSON config, the checkout containing this skill, then the canonical
 source. User config is `~/.agents/config.json` on Linux/macOS and
 `%USERPROFILE%\.agents\config.json` on Windows. System config is
-`/etc/agent-tools/config.json` or `%ProgramData%\AgentTools\config.json`.
+`/etc/agent-tools/config.json` on Linux/macOS or
+`%ProgramData%\AgentTools\config.json` on Windows.
 When a central, environment, or CLI source has no explicit ref, the installer
 reads that repository's manifest-only `latest-approved` branch, validates its
 source binding and catalog/package digests, then fetches the payload by its
