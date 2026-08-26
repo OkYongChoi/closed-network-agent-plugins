@@ -268,6 +268,41 @@ Import a skill from a pinned internal Git source:
   --path skills/repo-summary
 ```
 
+## Contribute a new plugin
+
+Create new work on a topic branch; do not push directly to the protected
+`main` branch:
+
+```bash
+git switch -c feat/add-my-plugin
+./bin/create-plugin my-plugin --output ./plugins
+```
+
+Complete the generated package, then refresh the catalog and run the repository
+checks. Do not calculate or edit the digest by hand:
+
+```bash
+python3 -B scripts/refresh_catalog.py
+python3 -B scripts/refresh_catalog.py --check
+python3 -B scripts/validate_repo.py
+python3 -B -m unittest discover -s tests -v
+git diff --check
+```
+
+Review the new `plugins/my-plugin` tree and the generated `catalog.json` entry,
+then include both in the same commit and pull request:
+
+```bash
+git add plugins/my-plugin catalog.json
+git commit -m "feat: add my-plugin"
+git push -u origin feat/add-my-plugin
+```
+
+Open a pull request into `main` and merge it only after the required review and
+CI checks pass. For an existing plugin change, skip the creation command and run
+the same catalog-refresh and validation steps before committing. On Windows,
+use `bin\create-plugin.ps1` and `python` instead of `python3`.
+
 ## List and install
 
 ```bash
@@ -409,6 +444,17 @@ Git SHA verification authenticates the requested checkout identity; SHA-256
 then verifies the selected package against that checkout's catalog. v1 does not
 provide artifact signatures.
 
+After intentionally changing a plugin, refresh its catalog digest and review
+the resulting `catalog.json` diff before committing the change:
+
+```bash
+python3 -B scripts/refresh_catalog.py
+python3 -B scripts/refresh_catalog.py --check
+```
+
+Use `python` instead of `python3` on Windows. The refresh command preserves the
+catalog's repository value and deterministically rebuilds the plugin entries.
+
 The installer copies the selected package into a private snapshot before
 loading or hashing it. Installation and projection use only that verified
 snapshot, so a concurrently changing shared mirror cannot alter bytes between
@@ -417,6 +463,7 @@ verification and installation.
 ## Validation
 
 ```bash
+python3 -B scripts/refresh_catalog.py --check
 python3 -B scripts/validate_repo.py
 python3 -B -m unittest discover -s tests -v
 python3 -B tests/platform_verify.py --autocrlf true

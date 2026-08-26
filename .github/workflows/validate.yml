@@ -20,7 +20,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Validate repository
-        run: python -B scripts/validate_repo.py
+        run: |
+          python -B scripts/refresh_catalog.py --check
+          python -B scripts/validate_repo.py
       - name: Run tests
         run: python -B -m unittest discover -s tests -v
       - name: Verify core.autocrlf checkout offline
