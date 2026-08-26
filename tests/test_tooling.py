@@ -165,90 +165,15 @@ class ToolingTests(unittest.TestCase):
         with self.assertRaises(installer.InstallError):
             installer.validate_portable_relative(("x" * 121, "y" * 120))
 
-    def test_creator_builds_canonical_and_isolated_projections(self):
+    def test_creator_builds_canonical_package(self):
         with tempfile.TemporaryDirectory() as temp:
             args = argparse.Namespace(
-                name="Demo Plugin", output=temp, adapters="codex,claude",
-                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
-                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
+                name="Demo Plugin", output=temp, version="0.1.0", description="Demo",
+                author="Team", license="Apache-2.0", import_skill=None, ref=None,
+                path=None, import_license="Apache-2.0",
             )
             canonical = creator.create_plugin(args)
             self.assertEqual(creator.validate_plugin(canonical)["name"], "demo-plugin")
-            self.assertFalse((canonical / ".codex-plugin").exists())
-            self.assertFalse((canonical / ".claude-plugin").exists())
-            self.assertTrue((Path(temp) / ".staging/codex/plugins/demo-plugin/.codex-plugin/plugin.json").is_file())
-            self.assertTrue((Path(temp) / ".staging/claude/plugins/demo-plugin/.claude-plugin/plugin.json").is_file())
-
-    def test_creator_publication_rolls_back_after_adapter_failure(self):
-        with tempfile.TemporaryDirectory() as temp:
-            output = Path(temp)
-            args = argparse.Namespace(
-                name="rollback-plugin", output=temp, adapters="codex,claude",
-                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
-                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
-            )
-            actual_replace = creator.os.replace
-            calls = 0
-
-            def fail_second_publish(source, destination):
-                nonlocal calls
-                calls += 1
-                if calls == 3:
-                    raise OSError("simulated adapter publication failure")
-                return actual_replace(source, destination)
-
-            with mock.patch.object(creator.os, "replace", side_effect=fail_second_publish):
-                with self.assertRaises(creator.PluginError):
-                    creator.create_plugin(args)
-            self.assertFalse((output / "rollback-plugin").exists())
-            self.assertFalse((output / ".staging/codex").exists())
-            self.assertFalse((output / ".staging/claude").exists())
-            self.assertFalse(any(path.name.startswith(".rollback-plugin.create-") for path in output.iterdir()))
-
-    def test_creator_rejects_symlinked_projection_staging_root(self):
-        with tempfile.TemporaryDirectory() as temp:
-            base = Path(temp)
-            output = base / "output"
-            outside = base / "outside"
-            output.mkdir()
-            outside.mkdir()
-            try:
-                (output / ".staging").symlink_to(outside, target_is_directory=True)
-            except OSError as exc:
-                self.skipTest(f"directory symlink creation is unavailable: {exc}")
-            args = argparse.Namespace(
-                name="safe-plugin", output=str(output), adapters="codex",
-                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
-                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
-            )
-            with self.assertRaises(creator.PluginError):
-                creator.create_plugin(args)
-            self.assertFalse((output / "safe-plugin").exists())
-            self.assertEqual(list(outside.iterdir()), [])
-
-    @unittest.skipUnless(os.name == "nt", "junction semantics require Windows")
-    def test_creator_rejects_junctioned_projection_staging_root_on_windows(self):
-        with tempfile.TemporaryDirectory() as temp:
-            base = Path(temp)
-            output = base / "output"
-            outside = base / "outside"
-            output.mkdir()
-            outside.mkdir()
-            result = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(output / ".staging"), str(outside)],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            if result.returncode != 0:
-                self.skipTest(f"junction creation is unavailable: {result.stdout.strip()}")
-            args = argparse.Namespace(
-                name="safe-plugin", output=str(output), adapters="codex",
-                version="0.1.0", description="Demo", author="Team", license="Apache-2.0",
-                import_skill=None, ref=None, path=None, import_license="Apache-2.0",
-            )
-            with self.assertRaises(creator.PluginError):
-                creator.create_plugin(args)
-            self.assertFalse((output / "safe-plugin").exists())
-            self.assertEqual(list(outside.iterdir()), [])
 
     def test_creator_rejects_invalid_frontmatter_and_mcp(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -372,91 +297,6 @@ class ToolingTests(unittest.TestCase):
             with self.assertRaises(creator.PluginError):
                 creator.validate_plugin(root)
 
-    def test_native_mcp_projection_maps_streamable_http(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = make_plugin(Path(temp))
-            (root / "mcp.json").write_text(json.dumps({
-                "$schema": installer.MCP_SCHEMA,
-                "mcpServers": {
-                    "remote": {"type": "streamable-http", "url": "https://example.com/mcp"}
-                },
-            }))
-            loaded = installer.load_plugin(root)
-            for target in ("codex", "claude"):
-                output = Path(temp) / f"projected-{target}"
-                installer.project_plugin(root, loaded, target, output)
-                native = json.loads((output / ".mcp.json").read_text())
-                self.assertEqual(native["mcpServers"]["remote"]["type"], "http")
-            codex_manifest = json.loads((Path(temp) / "projected-codex/.codex-plugin/plugin.json").read_text())
-            self.assertEqual(codex_manifest["mcpServers"], "./.mcp.json")
-
-    def test_minimal_portable_manifest_gets_identical_native_defaults(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = make_plugin(Path(temp), author={"email": "   ", "url": ""})
-            original = json.loads((root / "plugin.json").read_text())
-            creator.build_projection(root, "codex", Path(temp) / "creator-stage")
-            creator.build_projection(root, "claude", Path(temp) / "creator-stage")
-            loaded = installer.load_plugin(root)
-            installer.project_plugin(root, loaded, "codex", Path(temp) / "installer-codex")
-            installer.project_plugin(root, loaded, "claude", Path(temp) / "installer-claude")
-            manifests = [
-                json.loads((Path(temp) / "creator-stage/codex/plugins/boundary-plugin/.codex-plugin/plugin.json").read_text()),
-                json.loads((Path(temp) / "creator-stage/claude/plugins/boundary-plugin/.claude-plugin/plugin.json").read_text()),
-                json.loads((Path(temp) / "installer-codex/.codex-plugin/plugin.json").read_text()),
-                json.loads((Path(temp) / "installer-claude/.claude-plugin/plugin.json").read_text()),
-            ]
-            for manifest in manifests:
-                self.assertEqual(manifest["version"], "0.1.0")
-                self.assertEqual(manifest["description"], "Portable projection for boundary-plugin.")
-                self.assertEqual(manifest["author"], {"name": "Unknown"})
-            self.assertEqual(json.loads((root / "plugin.json").read_text()), original)
-
-    def test_native_author_url_requires_well_formed_https_origin(self):
-        invalid = (
-            "https://",
-            "https://example.com:not-a-port",
-            "https://user@example.com/profile",
-            "https://example.com/profile#fragment",
-            "https://bad host.example/profile",
-        )
-        for value in invalid:
-            canonical = {
-                "$schema": installer.PLUGIN_SCHEMA,
-                "name": "url-test",
-                "author": {"name": "Test", "url": value},
-            }
-            before = json.loads(json.dumps(canonical))
-            self.assertNotIn("url", creator._native_manifest(canonical)["author"])
-            self.assertNotIn("url", installer._native_manifest(canonical)["author"])
-            self.assertEqual(canonical, before)
-        valid = {
-            "$schema": installer.PLUGIN_SCHEMA,
-            "name": "url-test",
-            "author": {"name": "Test", "url": "https://docs.example.com:8443/profile"},
-        }
-        self.assertEqual(creator._native_manifest(valid)["author"]["url"], valid["author"]["url"])
-        self.assertEqual(installer._native_manifest(valid)["author"]["url"], valid["author"]["url"])
-
-    def test_claude_dest_must_be_marketplace_plugins_directory(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            invalid = argparse.Namespace(
-                dest=str(root / "arbitrary"), agent_home=str(root / ".claude"),
-                scope="user", target="claude",
-            )
-            with self.assertRaises(installer.InstallError):
-                installer._layout(invalid, "demo")
-            valid = argparse.Namespace(
-                dest=str(root / "marketplace/plugins"), agent_home=str(root / ".claude"),
-                scope="user", target="claude",
-            )
-            layout = installer._layout(valid, "demo")
-            self.assertEqual(layout.destination, (root / "marketplace/plugins/demo").resolve())
-            self.assertEqual(
-                layout.marketplace_path,
-                (root / "marketplace/.claude-plugin/marketplace.json").resolve(),
-            )
-
     def test_local_ref_materializes_committed_tree_and_unpinned_provenance_is_null(self):
         with tempfile.TemporaryDirectory() as temp:
             repository = Path(temp) / "source"
@@ -495,45 +335,6 @@ class ToolingTests(unittest.TestCase):
                 self.assertEqual(actual, commit)
                 self.assertIn("Committed version", (materialized / "skills/demo/SKILL.md").read_text())
                 self.assertFalse((materialized / "skills/demo/UNTRACKED").exists())
-
-    def test_marketplace_lock_is_shared_across_plugin_names(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            first = make_plugin(root, "first-plugin")
-            second = make_plugin(root, "second-plugin")
-            first_loaded = installer.load_plugin(first)
-            second_loaded = installer.load_plugin(second)
-            agent_home = root / "home/.agents"
-            args = argparse.Namespace(dest=None, agent_home=str(agent_home), scope="user", target="codex")
-            entered = threading.Event()
-            release = threading.Event()
-            original = installer.project_plugin
-            outcomes: list[object] = []
-
-            def blocking_project(source, loaded, target, output):
-                if loaded.manifest["name"] == "first-plugin":
-                    entered.set()
-                    self.assertTrue(release.wait(5))
-                return original(source, loaded, target, output)
-
-            def run_first():
-                try:
-                    outcomes.append(installer.install(first, first_loaded, args))
-                except Exception as exc:
-                    outcomes.append(exc)
-
-            with mock.patch.object(installer, "project_plugin", side_effect=blocking_project):
-                thread = threading.Thread(target=run_first)
-                thread.start()
-                self.assertTrue(entered.wait(5))
-                with self.assertRaises(installer.InstallError):
-                    installer.install(second, second_loaded, args)
-                release.set()
-                thread.join(5)
-            self.assertEqual(len(outcomes), 1)
-            self.assertIsInstance(outcomes[0], Path)
-            marketplace = json.loads((agent_home / "plugins/marketplace.json").read_text())
-            self.assertEqual([item["name"] for item in marketplace["plugins"]], ["first-plugin"])
 
     def test_symlink_and_catalog_traversal_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -671,47 +472,16 @@ class ToolingTests(unittest.TestCase):
                 destination = installer.install(snapshot, loaded, args)
             self.assertEqual((destination / "payload.txt").read_text(), "verified-bytes")
 
-    def test_all_install_targets_and_no_runtime_cross_fetch(self):
+    def test_install_uses_no_runtime_cross_fetch(self):
         entries = installer.read_catalog(ROOT)
         entry = installer.select_entry(entries, "engineering-starter")
         with installer.verify_entry(ROOT, entry) as (plugin_root, manifest):
             with tempfile.TemporaryDirectory() as temp:
-                for target in ("portable", "codex", "claude"):
-                    target_root = Path(temp) / target
-                    if target == "portable":
-                        args = argparse.Namespace(dest=str(target_root / "plugins"), agent_home=None, scope="user", target=target)
-                    else:
-                        args = argparse.Namespace(
-                            dest=None,
-                            agent_home=str(target_root / (".agents" if target == "codex" else ".claude")),
-                            scope="user",
-                            target=target,
-                        )
-                    with mock.patch.object(installer, "run_git", side_effect=AssertionError("unexpected network/git fetch")):
-                        destination = installer.install(plugin_root, manifest, args)
-                    self.assertTrue((destination / "plugin.json").is_file())
-                    if target != "portable":
-                        self.assertTrue((destination / f".{target}-plugin/plugin.json").is_file())
-                    if target == "codex":
-                        self.assertEqual(destination, (target_root / "plugins/engineering-starter").resolve())
-                        self.assertTrue((target_root / ".agents/plugins/marketplace.json").is_file())
-                    elif target == "claude":
-                        marketplace_root = target_root / ".claude/plugins/marketplaces/okyongchoi-portable"
-                        self.assertEqual(destination, (marketplace_root / "plugins/engineering-starter").resolve())
-                        self.assertTrue((marketplace_root / ".claude-plugin/marketplace.json").is_file())
-
-    def test_invalid_marketplace_leaves_no_partial_install(self):
-        entries = installer.read_catalog(ROOT)
-        with installer.verify_entry(ROOT, installer.select_entry(entries, "engineering-starter")) as (plugin_root, manifest):
-            with tempfile.TemporaryDirectory() as temp:
-                parent = Path(temp)
-                marketplace = parent / ".agents/plugins/marketplace.json"
-                marketplace.parent.mkdir(parents=True)
-                marketplace.write_text("[]")
-                args = argparse.Namespace(dest=None, agent_home=str(parent / ".agents"), scope="user", target="codex")
-                with self.assertRaises(installer.InstallError):
-                    installer.install(plugin_root, manifest, args)
-                self.assertFalse((parent / "plugins/engineering-starter").exists())
+                target_root = Path(temp)
+                args = argparse.Namespace(dest=str(target_root / "plugins"), agent_home=None, scope="user")
+                with mock.patch.object(installer, "run_git", side_effect=AssertionError("unexpected network/git fetch")):
+                    destination = installer.install(plugin_root, manifest, args)
+                self.assertTrue((destination / "plugin.json").is_file())
 
     def test_concurrent_lock_blocks_install(self):
         entries = installer.read_catalog(ROOT)
@@ -929,7 +699,6 @@ class ToolingTests(unittest.TestCase):
                     "source": "/system/source",
                     "ref": "1" * 40,
                     "allowMutableRef": True,
-                    "defaultTarget": "claude",
                 },
                 "agentHome": "/system/home",
             }), encoding="utf-8")
@@ -938,14 +707,12 @@ class ToolingTests(unittest.TestCase):
                 "plugins": {
                     "ref": "2" * 40,
                     "allowMutableRef": False,
-                    "defaultTarget": "codex",
                 },
                 "agentHome": "/user/home",
             }), encoding="utf-8")
             args = installer.parser().parse_args([
                 "install", "engineering-starter",
                 "--source", "/cli/source",
-                "--target", "portable",
                 "--scope", "project",
                 "--agent-home", "/cli/home",
                 "--no-allow-mutable-ref",
@@ -957,7 +724,6 @@ class ToolingTests(unittest.TestCase):
                 effective = installer.resolve_effective_config(args)
             self.assertEqual(effective.source, "/cli/source")
             self.assertEqual(effective.ref, "3" * 40)
-            self.assertEqual(effective.target, "portable")
             self.assertEqual(effective.agent_home, str(Path("/cli/home").resolve()))
             self.assertEqual(effective.scope, "project")
             self.assertFalse(effective.allow_mutable_ref)
@@ -976,10 +742,8 @@ class ToolingTests(unittest.TestCase):
                 managed = installer.resolve_effective_config(managed_args)
             self.assertEqual(managed.source, "/environment/source")
             self.assertEqual(managed.ref, "3" * 40)
-            self.assertEqual(managed.target, "codex")
             self.assertEqual(managed.agent_home, str(Path("/user/home").resolve()))
             self.assertFalse(managed.allow_mutable_ref)
-            self.assertEqual(managed.provenance["target"], "user-config")
 
             project_args = installer.parser().parse_args([
                 "install", "engineering-starter", "--scope", "project"
@@ -1014,7 +778,6 @@ class ToolingTests(unittest.TestCase):
             self.assertEqual(effective.source, "/system/source")
             self.assertEqual(effective.ref, "a" * 40)
             self.assertEqual(effective.agent_home, str((user_home / ".company-agents").resolve()))
-            self.assertEqual(effective.target, "portable")
             self.assertEqual(effective.scope, "user")
 
             system_path.unlink()
@@ -1072,7 +835,6 @@ class ToolingTests(unittest.TestCase):
                 '{"unknown": true}',
                 '{"plugins": {"source": 42}}',
                 '{"plugins": {"allowMutableRef": "false"}}',
-                '{"plugins": {"defaultTarget": "other"}}',
                 '{"agentHome": " surrounded "}',
                 json.dumps({"agentHome": "x\x00y"}),
                 json.dumps({"plugins": {"source": "x\x00y"}}),
@@ -1147,7 +909,6 @@ class ToolingTests(unittest.TestCase):
             "https://user:secret@git.example/plugins.git?token=secret#fragment",
             "a" * 40,
             False,
-            "portable",
             None,
             "user",
             {"source": "cli"},
@@ -1198,7 +959,7 @@ class ToolingTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repository), "commit", "-qm", "approve"], check=True)
 
             effective = installer.EffectiveConfig(
-                str(repository), None, False, "portable", str(Path(temp) / ".agents"),
+                str(repository), None, False, str(Path(temp) / ".agents"),
                 "user", {"source": "system-config", "ref": "approval-pointer"},
             )
             with installer.materialize_effective_source(effective) as (root, actual, release):
@@ -1210,7 +971,7 @@ class ToolingTests(unittest.TestCase):
             self.assertTrue(installer._local_has_approved_pointer(str(repository)))
             self.assertFalse(installer._local_has_approved_pointer(str(ROOT)))
             direct = installer.EffectiveConfig(
-                str(ROOT), None, False, "portable", str(Path(temp) / ".agents"),
+                str(ROOT), None, False, str(Path(temp) / ".agents"),
                 "user", {"source": "cli", "ref": "local-source"},
             )
             with installer.materialize_effective_source(direct) as (
@@ -1229,9 +990,8 @@ class ToolingTests(unittest.TestCase):
                 with installer.resolve_approved_release(str(repository)):
                     pass
 
-    def test_update_is_atomic_and_preserves_marketplace_and_state_on_failure(self):
-        for target in ("portable", "codex", "claude"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as temp:
+    def test_update_is_atomic_and_preserves_state_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 (root / "v1").mkdir()
                 source_v1 = make_plugin(root / "v1", "update-plugin", version="1.0.0")
@@ -1241,9 +1001,9 @@ class ToolingTests(unittest.TestCase):
                 source_v2 = make_plugin(root / "v2", "update-plugin", version="2.0.0")
                 (source_v2 / "payload.txt").write_text("new", encoding="utf-8")
                 loaded_v2 = installer.load_plugin(source_v2)
-                agent_home = root / (".claude" if target == "claude" else ".agents")
+                agent_home = root / ".agents"
                 args = argparse.Namespace(
-                    dest=None, agent_home=str(agent_home), scope="user", target=target,
+                    dest=None, agent_home=str(agent_home), scope="user",
                 )
                 old_record = installer.InstallRecord(
                     "https://gitlab.company.local/ai/plugins.git", "1" * 40,
@@ -1256,12 +1016,8 @@ class ToolingTests(unittest.TestCase):
                 destination = installer.install(source_v1, loaded_v1, args, old_record)
                 layout = installer._layout(args, "update-plugin")
                 old_state = layout.state_path.read_bytes()
-                old_marketplace = (
-                    layout.marketplace_path.read_bytes() if layout.marketplace_path else None
-                )
                 actual_replace = installer.os.replace
-                # Fail last, after vendor marketplace publication, so rollback
-                # must restore the plugin, marketplace, and state together.
+                # Fail state publication so rollback must restore the plugin and state.
                 failure_target = layout.state_path
 
                 def fail_publication(source, target_path):
@@ -1275,32 +1031,17 @@ class ToolingTests(unittest.TestCase):
                         installer.update_installation(source_v2, loaded_v2, args, new_record)
                 self.assertEqual((destination / "payload.txt").read_text(encoding="utf-8"), "old")
                 self.assertEqual(layout.state_path.read_bytes(), old_state)
-                if layout.marketplace_path:
-                    self.assertEqual(layout.marketplace_path.read_bytes(), old_marketplace)
 
                 updated, changed = installer.update_installation(
                     source_v2, loaded_v2, args, new_record
                 )
                 self.assertTrue(changed)
                 self.assertEqual((updated / "payload.txt").read_text(encoding="utf-8"), "new")
-                if layout.marketplace_path:
-                    marketplace = json.loads(layout.marketplace_path.read_text(encoding="utf-8"))
-                    self.assertEqual(
-                        sum(item.get("name") == "update-plugin" for item in marketplace["plugins"]), 1
-                    )
                 same, changed = installer.update_installation(
                     source_v2, loaded_v2, args, new_record
                 )
                 self.assertEqual(same, updated)
                 self.assertFalse(changed)
-                if layout.marketplace_path:
-                    layout.marketplace_path.unlink()
-                    repaired_marketplace, changed = installer.update_installation(
-                        source_v2, loaded_v2, args, new_record
-                    )
-                    self.assertTrue(changed)
-                    self.assertTrue(layout.marketplace_path.is_file())
-                    self.assertEqual(repaired_marketplace, updated)
                 (updated / "payload.txt").write_text("tampered", encoding="utf-8")
                 repaired, changed = installer.update_installation(
                     source_v2, loaded_v2, args, new_record

@@ -34,7 +34,6 @@ NAME_RE = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 MAX_FILES = 2_000
 MAX_BYTES = 50 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 60
@@ -60,7 +59,7 @@ FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 MAX_CONFIG_BYTES = 64 * 1024
 CONFIG_TOP_LEVEL_KEYS = frozenset({"skills", "plugins", "agentHome"})
 CONFIG_REPOSITORY_KEYS = frozenset({"source", "ref", "allowMutableRef"})
-CONFIG_PLUGIN_KEYS = CONFIG_REPOSITORY_KEYS | {"defaultTarget"}
+CONFIG_PLUGIN_KEYS = CONFIG_REPOSITORY_KEYS
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 RELEASE_MANIFEST_KEYS = frozenset({
     "formatVersion", "kind", "name", "source", "ref", "version", "updatedAt",
@@ -78,7 +77,6 @@ class EffectiveConfig(NamedTuple):
     source: str
     ref: str | None
     allow_mutable_ref: bool
-    target: str
     agent_home: str | None
     scope: str
     provenance: dict[str, str]
@@ -263,7 +261,6 @@ class LoadedPlugin(NamedTuple):
 class InstallLayout(NamedTuple):
     plugin_parent: Path
     destination: Path
-    marketplace_path: Path | None
     state_path: Path
     lock_path: Path
 
@@ -625,11 +622,6 @@ def _validate_repository_config(value: Any, *, section: str, path: Path) -> None
             )
     if "allowMutableRef" in value and not isinstance(value["allowMutableRef"], bool):
         raise InstallError(f"invalid config {path}: {section}.allowMutableRef must be boolean")
-    if section == "plugins" and "defaultTarget" in value:
-        if value["defaultTarget"] not in {"portable", "codex", "claude"}:
-            raise InstallError(
-                f"invalid config {path}: plugins.defaultTarget must be portable, codex, or claude"
-            )
 
 
 def _read_config_bytes(path: Path) -> bytes | None:
@@ -808,15 +800,6 @@ def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
         field="allowMutableRef",
         provenance=provenance,
     )
-    target = _select_value(
-        getattr(args, "target", None),
-        None,
-        user_plugins.get("defaultTarget"),
-        system_plugins.get("defaultTarget"),
-        "portable",
-        field="target",
-        provenance=provenance,
-    )
     agent_home = _select_value(
         getattr(args, "agent_home", None),
         None,
@@ -843,15 +826,14 @@ def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
     if agent_home is not None and not _valid_config_string(agent_home):
         raise InstallError("effective agent home must be a non-empty, trimmed string without NUL")
     if agent_home is None:
-        leaf = ".claude" if target == "claude" else ".agents"
         if scope == "project":
-            agent_home = str((Path.cwd() / leaf).resolve())
+            agent_home = str((Path.cwd() / ".agents").resolve())
             provenance["agentHome"] = (
                 f"project-default:ignored-{ignored_agent_home_origin}"
                 if ignored_agent_home_origin else "project-default"
             )
         else:
-            agent_home = str((user_home / leaf).resolve())
+            agent_home = str((user_home / ".agents").resolve())
             provenance["agentHome"] = "user-default"
     else:
         if agent_home == "~":
@@ -867,7 +849,7 @@ def resolve_effective_config(args: argparse.Namespace) -> EffectiveConfig:
         agent_home = str(resolved_home.resolve())
     if ref is not None and not FULL_SHA_RE.fullmatch(ref) and not allow_mutable:
         raise InstallError("effective ref must be a full commit SHA unless mutable refs are explicitly allowed")
-    return EffectiveConfig(source, ref, allow_mutable, target, agent_home, scope, provenance)
+    return EffectiveConfig(source, ref, allow_mutable, agent_home, scope, provenance)
 
 
 def _redact_source(source: str) -> str:
@@ -896,7 +878,6 @@ def effective_config_payload(config: EffectiveConfig) -> dict[str, Any]:
         "source": _redact_source(config.source),
         "ref": config.ref,
         "allowMutableRef": config.allow_mutable_ref,
-        "target": config.target,
         "agentHome": config.agent_home,
         "scope": config.scope,
         "provenance": config.provenance,
@@ -1248,70 +1229,7 @@ def verify_entry(root: Path, entry: dict[str, str]) -> Iterator[tuple[Path, Load
         yield plugin_root, loaded
 
 
-def _native_mcp(canonical: dict[str, Any]) -> dict[str, Any]:
-    servers: dict[str, Any] = {}
-    for name, server in canonical["mcpServers"].items():
-        native = dict(server)
-        if native.get("type") == "streamable-http":
-            native["type"] = "http"
-        servers[name] = native
-    return {"mcpServers": servers}
-
-
-def _native_https_url(value: Any) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        parsed = urlsplit(value)
-        _ = parsed.port
-    except ValueError:
-        return False
-    host = parsed.hostname
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or not host
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        pass
-    hostname = host[:-1] if host.endswith(".") else host
-    if not hostname or len(hostname) > 253:
-        return False
-    label_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-    return all(label_re.fullmatch(label) is not None for label in hostname.split("."))
-
-
-def _native_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    result = {k: v for k, v in manifest.items() if k not in {"$schema", "extensions"}}
-    name = manifest["name"]
-    version = manifest.get("version")
-    if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
-        result["version"] = "0.1.0"
-    description = manifest.get("description")
-    if not isinstance(description, str) or not description.strip():
-        result["description"] = f"Portable projection for {name}."
-    author = manifest.get("author")
-    native_author = dict(author) if isinstance(author, dict) else {}
-    if not isinstance(native_author.get("name"), str) or not native_author["name"].strip():
-        native_author["name"] = "Unknown"
-    if "email" in native_author and (
-        not isinstance(native_author["email"], str) or not native_author["email"].strip()
-    ):
-        native_author.pop("email")
-    if "url" in native_author and not _native_https_url(native_author["url"]):
-        native_author.pop("url")
-    result["author"] = native_author
-    return result
-
-
-def project_plugin(source: Path, loaded: LoadedPlugin, target: str, output: Path) -> None:
+def project_plugin(source: Path, loaded: LoadedPlugin, output: Path) -> None:
     shutil.copytree(source, output, symlinks=False)
     manifest = loaded.manifest
     write_json(output / "plugin.json", manifest)
@@ -1334,117 +1252,19 @@ def project_plugin(source: Path, loaded: LoadedPlugin, target: str, output: Path
                 mcp_path.unlink()
     else:
         write_json(mcp_path, loaded.mcp)
-    if target == "portable":
-        return
-    if loaded.mcp is not None:
-        write_json(output / ".mcp.json", _native_mcp(loaded.mcp))
-    portable = _native_manifest(manifest)
-    if target == "codex":
-        description = portable["description"]
-        portable["skills"] = "./skills/"
-        if loaded.mcp is not None:
-            portable["mcpServers"] = "./.mcp.json"
-        portable["interface"] = {
-            "displayName": manifest["name"].replace("-", " ").title(),
-            "shortDescription": description[:120],
-            "longDescription": description,
-            "developerName": portable["author"]["name"],
-            "category": "Developer Tools",
-            "capabilities": ["Read", "Write"],
-            "defaultPrompt": [f"Use {manifest['name']} to help with this task."],
-        }
-        write_json(output / ".codex-plugin" / "plugin.json", portable)
-    elif target == "claude":
-        write_json(output / ".claude-plugin" / "plugin.json", portable)
-    else:
-        raise InstallError(f"unsupported target: {target}")
-
-
-def marketplace_value(
-    path: Path, target: str, manifest: dict[str, Any], *, replace_existing: bool = False
-) -> dict[str, Any]:
-    name = manifest["name"]
-    if os.path.lexists(path):
-        path_stat = path.lstat()
-        if path.is_symlink() or _is_reparse(path_stat) or not stat.S_ISREG(path_stat.st_mode):
-            raise InstallError(f"marketplace must be a real regular file: {path}")
-        value = load_json(path)
-        if not isinstance(value, dict) or not isinstance(value.get("plugins"), list):
-            raise InstallError(f"invalid existing marketplace: {path}")
-    elif target == "codex":
-        value = {"name": "personal", "interface": {"displayName": "Personal"}, "plugins": []}
-    else:
-        value = {
-            "name": "personal",
-            "owner": {"name": "Local"},
-            "metadata": {"description": "Local projections installed from portable Agent Plugins."},
-            "plugins": [],
-        }
-    matches = [
-        index for index, item in enumerate(value["plugins"])
-        if isinstance(item, dict) and item.get("name") == name
-    ]
-    if len(matches) > 1:
-        raise InstallError(f"marketplace contains duplicate entries for {name}")
-    if matches and not replace_existing:
-        raise InstallError(f"marketplace already contains {name}")
-    if target == "codex":
-        entry = {
-            "name": name,
-            "source": {"source": "local", "path": f"./plugins/{name}"},
-            "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-            "category": "Developer Tools",
-        }
-    else:
-        native = _native_manifest(manifest)
-        entry = {
-            "name": name,
-            "source": f"./plugins/{name}",
-            "description": native["description"],
-            "version": native["version"],
-        }
-    if matches:
-        value["plugins"][matches[0]] = entry
-    else:
-        value["plugins"].append(entry)
-    return value
-
-
 def _layout(args: argparse.Namespace, name: str) -> InstallLayout:
     if args.agent_home:
         agent_home = Path(args.agent_home).expanduser().resolve()
     elif args.scope == "project":
-        agent_home = Path.cwd().resolve() / (".claude" if args.target == "claude" else ".agents")
+        agent_home = Path.cwd().resolve() / ".agents"
     else:
-        agent_home = Path.home() / (".claude" if args.target == "claude" else ".agents")
+        agent_home = Path.home() / ".agents"
 
     explicit_parent = Path(args.dest).expanduser().resolve() if args.dest else None
-    if args.target == "portable":
-        parent = explicit_parent or agent_home / "plugins"
-        return InstallLayout(
-            parent, parent / name, None, parent / f".{name}.install-state.json",
-            parent / f".{name}.install.lock",
-        )
-    if args.target == "codex":
-        # Codex resolves ./plugins/name in ~/.agents/plugins/marketplace.json to ~/plugins/name.
-        expected_parent = agent_home.parent / "plugins"
-        if explicit_parent is not None and explicit_parent != expected_parent:
-            raise InstallError(f"Codex --dest must be {expected_parent} for marketplace path semantics")
-        parent = expected_parent
-        marketplace = agent_home / "plugins" / "marketplace.json"
-        return InstallLayout(
-            parent, parent / name, marketplace, parent / f".{name}.install-state.json",
-            marketplace.parent / ".marketplace.install.lock",
-        )
-    # Claude marketplaces are self-contained roots with .claude-plugin/ and plugins/ siblings.
-    if explicit_parent is not None and explicit_parent.name != "plugins":
-        raise InstallError("Claude --dest must name the plugins/ directory directly below a marketplace root")
-    marketplace_root = explicit_parent.parent if explicit_parent else agent_home / "plugins/marketplaces/okyongchoi-portable"
-    parent = explicit_parent or marketplace_root / "plugins"
-    marketplace = marketplace_root / ".claude-plugin" / "marketplace.json"
+    parent = explicit_parent or agent_home / "plugins"
     return InstallLayout(
-        parent, parent / name, marketplace, parent / f".{name}.install-state.json",
-        marketplace_root / ".marketplace.install.lock",
+        parent, parent / name, parent / f".{name}.install-state.json",
+        parent / f".{name}.install.lock",
     )
 
 
@@ -1702,7 +1522,6 @@ def _install_state_payload(
         "digest": record.digest,
         "installedDigest": installed_digest,
         "version": record.version,
-        "target": args.target,
         "installedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -1717,7 +1536,7 @@ def _read_install_state(path: Path) -> dict[str, Any] | None:
         raise InstallError(f"invalid installation state {path}: {exc}") from exc
     required = {
         "formatVersion", "name", "source", "ref", "digest", "installedDigest",
-        "version", "target", "installedAt",
+        "version", "installedAt",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("formatVersion") != 1:
         raise InstallError(f"invalid installation state schema: {path}")
@@ -1728,7 +1547,6 @@ def _read_install_state(path: Path) -> dict[str, Any] | None:
         or not isinstance(value.get("digest"), str)
         or not isinstance(value.get("installedDigest"), str)
         or (value.get("version") is not None and not isinstance(value.get("version"), str))
-        or value.get("target") not in {"portable", "codex", "claude"}
         or not isinstance(value.get("installedAt"), str)
     ):
         raise InstallError(f"invalid installation state values: {path}")
@@ -1749,7 +1567,6 @@ def _state_matches(
         state.get("ref") == record.ref,
         state.get("digest") == record.digest,
         state.get("version") == record.version,
-        state.get("target") == args.target,
     ))
 
 
@@ -1813,21 +1630,9 @@ def _publish_installation(
         try:
             temp_root = Path(tempfile.mkdtemp(prefix=f".{manifest['name']}.", dir=parent))
             staged = temp_root / manifest["name"]
-            project_plugin(source_plugin, loaded, args.target, staged)
-            validate_projection(staged, manifest["name"], args.target)
+            project_plugin(source_plugin, loaded, staged)
+            load_plugin(staged)
             installed_digest = tree_digest(staged)
-            marketplace = layout.marketplace_path
-            marketplace_data = (
-                marketplace_value(
-                    marketplace, args.target, manifest, replace_existing=replace_existing
-                ) if marketplace else None
-            )
-            marketplace_tmp = (
-                _temporary_json(marketplace, marketplace_data)
-                if marketplace is not None and marketplace_data is not None else None
-            )
-            if marketplace_tmp is not None:
-                temporary_files.append(marketplace_tmp)
             state_tmp = (
                 _temporary_json(
                     layout.state_path,
@@ -1840,38 +1645,23 @@ def _publish_installation(
 
             token = secrets.token_hex(8)
             backup_destination = parent / f".{manifest['name']}.backup-{token}"
-            backup_marketplace = (
-                marketplace.with_name(f".{marketplace.name}.backup-{token}") if marketplace else None
-            )
             backup_state = layout.state_path.with_name(
                 f".{layout.state_path.name}.backup-{token}"
             )
-            marketplace_existed = (
-                marketplace is not None and os.path.lexists(marketplace)
-            )
             state_existed = os.path.lexists(layout.state_path)
             moved_destination = False
-            moved_marketplace = False
             moved_state = False
             published_destination = False
-            published_marketplace = False
             published_state = False
             try:
                 if replace_existing:
                     os.replace(destination, backup_destination)
                     moved_destination = True
-                if marketplace_existed:
-                    os.replace(marketplace, backup_marketplace)
-                    moved_marketplace = True
                 if state_existed:
                     os.replace(layout.state_path, backup_state)
                     moved_state = True
                 os.replace(staged, destination)
                 published_destination = True
-                if marketplace is not None and marketplace_tmp is not None:
-                    os.replace(marketplace_tmp, marketplace)
-                    temporary_files.remove(marketplace_tmp)
-                    published_marketplace = True
                 if state_tmp is not None:
                     os.replace(state_tmp, layout.state_path)
                     temporary_files.remove(state_tmp)
@@ -1888,12 +1678,6 @@ def _publish_installation(
                         backup_state,
                         state_tmp,
                         state_existed,
-                    ),
-                    (
-                        marketplace,
-                        backup_marketplace,
-                        marketplace_tmp,
-                        marketplace_existed,
                     ),
                     (
                         destination,
@@ -1927,11 +1711,6 @@ def _publish_installation(
                 raise
             if moved_destination:
                 shutil.rmtree(backup_destination, ignore_errors=True)
-            if moved_marketplace and backup_marketplace is not None:
-                try:
-                    backup_marketplace.unlink()
-                except OSError:
-                    pass
             if moved_state:
                 try:
                     backup_state.unlink()
@@ -1974,49 +1753,15 @@ def update_installation(
         )
     state = _read_install_state(layout.state_path)
     if _state_matches(state, loaded.manifest["name"], args, record):
-        validate_projection(layout.destination, loaded.manifest["name"], args.target)
-        marketplace_current = True
-        if layout.marketplace_path is not None:
-            marketplace_current = False
-            if os.path.lexists(layout.marketplace_path):
-                expected_marketplace = marketplace_value(
-                    layout.marketplace_path,
-                    args.target,
-                    loaded.manifest,
-                    replace_existing=True,
-                )
-                marketplace_current = (
-                    load_json(layout.marketplace_path) == expected_marketplace
-                )
+        load_plugin(layout.destination)
         if (
             tree_digest(layout.destination) == state.get("installedDigest")
-            and marketplace_current
         ):
             return layout.destination, False
     destination = _publish_installation(
         source_plugin, loaded, args, record, replace_existing=True
     )
     return destination, True
-
-
-def validate_projection(root: Path, name: str, target: str) -> None:
-    if target == "portable":
-        load_plugin(root)
-        return
-    vendor_manifest = root / f".{target}-plugin" / "plugin.json"
-    data = load_json(vendor_manifest)
-    if not isinstance(data, dict) or data.get("name") != name:
-        raise InstallError(f"invalid {target} projection")
-    native_mcp = root / ".mcp.json"
-    if native_mcp.exists():
-        payload = load_json(native_mcp)
-        if not isinstance(payload, dict) or set(payload) != {"mcpServers"} or not isinstance(payload["mcpServers"], dict):
-            raise InstallError(f"invalid {target} native .mcp.json")
-        for server_name, server in payload["mcpServers"].items():
-            if not isinstance(server_name, str) or not server_name or not isinstance(server, dict):
-                raise InstallError(f"invalid {target} native MCP server entry")
-            if server.get("type") == "streamable-http":
-                raise InstallError(f"unprojected Agent Plugins MCP transport in {target} layout")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2035,14 +1780,12 @@ def parser() -> argparse.ArgumentParser:
     ):
         command_parser = sub.add_parser(command, parents=[common], help=help_text)
         command_parser.add_argument("name")
-        command_parser.add_argument("--target", choices=("portable", "codex", "claude"))
         command_parser.add_argument("--agent-home")
         command_parser.add_argument("--scope", choices=("user", "project"))
         command_parser.add_argument("--dest", help="override the destination plugin parent")
     config_parser = sub.add_parser(
         "effective-config", parents=[common], help="print resolved settings and their provenance"
     )
-    config_parser.add_argument("--target", choices=("portable", "codex", "claude"))
     config_parser.add_argument("--agent-home")
     config_parser.add_argument("--scope", choices=("user", "project"))
     return result
@@ -2055,7 +1798,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "effective-config":
             print(json.dumps(effective_config_payload(effective), indent=2, sort_keys=True))
             return 0
-        args.target = effective.target
         args.agent_home = effective.agent_home
         args.scope = effective.scope
         with materialize_effective_source(effective) as (root, actual_ref, release):

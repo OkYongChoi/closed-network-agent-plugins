@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "plugin-creator",
   "version": "1.0.0",
-  "description": "Create portable Agent Plugins packages and isolated Codex or Claude projections.",
+  "description": "Create portable Agent Plugins packages for closed networks.",
   "author": {
     "name": "OkYongChoi",
     "url": "https://github.com/OkYongChoi"

@@ -1,29 +1,22 @@
 ---
 name: plugin-creator
-description: Create and validate portable Agent Plugins 1.0 packages, optionally importing a skill at a pinned Git commit and generating isolated Codex and Claude staging projections. Use when scaffolding a plugin for an offline or mirrored environment.
+description: Create and validate portable Agent Plugins 1.0 packages, optionally importing a skill at a pinned Git commit. Use when scaffolding a plugin for an offline or mirrored environment.
 ---
 
 # Plugin Creator
 
-Create the canonical package first. Keep vendor-specific files out of that
-package; projections are disposable staging output.
-
-Creation stages canonical and adapter output on the selected output filesystem,
-then publishes it as one rollback-capable transaction. This supports Windows
-drive-letter layouts and POSIX (Linux/macOS) mounts without cross-filesystem rename failures.
-Any existing `.staging` path must be a real non-reparse directory that resolves
-inside the output root; symlinked or junction-backed staging roots are rejected.
+Creation stages the canonical package on the selected output filesystem before
+publishing it. This supports Windows drive-letter layouts and POSIX
+(Linux/macOS) mounts without cross-filesystem rename failures.
 
 ## Create a plugin
 
 ```bash
 python3 scripts/create_plugin.py create-plugin my-plugin \
-  --output ./plugins \
-  --adapters codex,claude
+  --output ./plugins
 ```
 
-The canonical package is written to `./plugins/my-plugin`. Adapter projections
-are written below `./plugins/.staging/{codex,claude}`.
+The canonical package is written to `./plugins/my-plugin`.
 
 To import an existing Agent Skill, pin remote Git sources to a full commit SHA:
 

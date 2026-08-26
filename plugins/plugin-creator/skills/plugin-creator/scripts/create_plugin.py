@@ -556,147 +556,6 @@ def _copy_tree(source: Path, target: Path) -> None:
     shutil.copytree(source, target, symlinks=False)
 
 
-def _native_mcp(canonical: dict[str, Any]) -> dict[str, Any]:
-    servers: dict[str, Any] = {}
-    for name, server in canonical["mcpServers"].items():
-        native = dict(server)
-        if native.get("type") == "streamable-http":
-            native["type"] = "http"
-        servers[name] = native
-    return {"mcpServers": servers}
-
-
-def _native_https_url(value: Any) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        parsed = urlsplit(value)
-        _ = parsed.port
-    except ValueError:
-        return False
-    host = parsed.hostname
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or not host
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        pass
-    hostname = host[:-1] if host.endswith(".") else host
-    if not hostname or len(hostname) > 253:
-        return False
-    label_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-    return all(label_re.fullmatch(label) is not None for label in hostname.split("."))
-
-
-def _native_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    result = {k: v for k, v in manifest.items() if k not in {"$schema", "extensions"}}
-    name = manifest["name"]
-    version = manifest.get("version")
-    if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
-        result["version"] = "0.1.0"
-    description = manifest.get("description")
-    if not isinstance(description, str) or not description.strip():
-        result["description"] = f"Portable projection for {name}."
-    author = manifest.get("author")
-    native_author = dict(author) if isinstance(author, dict) else {}
-    if not isinstance(native_author.get("name"), str) or not native_author["name"].strip():
-        native_author["name"] = "Unknown"
-    if "email" in native_author and (
-        not isinstance(native_author["email"], str) or not native_author["email"].strip()
-    ):
-        native_author.pop("email")
-    if "url" in native_author and not _native_https_url(native_author["url"]):
-        native_author.pop("url")
-    result["author"] = native_author
-    return result
-
-
-def _codex_manifest(manifest: dict[str, Any], has_mcp: bool) -> dict[str, Any]:
-    name = manifest["name"]
-    result = _native_manifest(manifest)
-    description = result["description"]
-    result["skills"] = "./skills/"
-    if has_mcp:
-        result["mcpServers"] = "./.mcp.json"
-    result["interface"] = {
-        "displayName": name.replace("-", " ").title(),
-        "shortDescription": description[:120],
-        "longDescription": description,
-        "developerName": result["author"]["name"],
-        "category": "Developer Tools",
-        "capabilities": ["Read", "Write"],
-        "defaultPrompt": [f"Use {name} to help with this task."],
-    }
-    return result
-
-
-def _claude_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    return _native_manifest(manifest)
-
-
-def build_projection(canonical: Path, adapter: str, staging_root: Path) -> None:
-    manifest = validate_plugin(canonical)
-    name = manifest["name"]
-    adapter_root = staging_root / adapter
-    plugin_root = adapter_root / "plugins" / name
-    if plugin_root.exists():
-        raise PluginError(f"projection already exists: {plugin_root}")
-    _copy_tree(canonical, plugin_root)
-    canonical_mcp = _load_json(canonical / "mcp.json") if (canonical / "mcp.json").is_file() else None
-    if canonical_mcp is not None:
-        _write_json(plugin_root / ".mcp.json", _native_mcp(canonical_mcp))
-    if adapter == "codex":
-        (plugin_root / ".codex-plugin").mkdir()
-        _write_json(plugin_root / ".codex-plugin" / "plugin.json", _codex_manifest(manifest, canonical_mcp is not None))
-        _write_json(adapter_root / "marketplace.json", {
-            "name": "local-portable",
-            "interface": {"displayName": "Local Portable Plugins"},
-            "plugins": [{
-                "name": name,
-                "source": {"source": "local", "path": f"./plugins/{name}"},
-                "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-                "category": "Developer Tools",
-            }],
-        })
-    elif adapter == "claude":
-        (plugin_root / ".claude-plugin").mkdir()
-        _write_json(plugin_root / ".claude-plugin" / "plugin.json", _claude_manifest(manifest))
-        _write_json(adapter_root / ".claude-plugin" / "marketplace.json", {
-            "name": "local-portable",
-            "owner": {"name": manifest.get("author", {}).get("name", "Unknown")},
-            "metadata": {"description": "Local projections generated from portable Agent Plugins."},
-            "plugins": [{
-                "name": name,
-                "source": f"./plugins/{name}",
-                "description": manifest.get("description", ""),
-                "version": manifest.get("version", "0.1.0"),
-            }],
-        })
-    else:
-        raise PluginError(f"unsupported adapter: {adapter}")
-
-
-def _require_real_contained_directory(path: Path, root: Path, *, label: str) -> None:
-    try:
-        path_stat = path.lstat()
-    except OSError as exc:
-        raise PluginError(f"cannot inspect {label}: {path}: {exc}") from exc
-    if path.is_symlink() or _is_reparse(path_stat) or not stat.S_ISDIR(path_stat.st_mode):
-        raise PluginError(f"{label} must be a real non-reparse directory: {path}")
-    try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
-    except (OSError, ValueError) as exc:
-        raise PluginError(f"{label} escapes the output directory: {path}") from exc
-
-
 def create_plugin(args: argparse.Namespace) -> Path:
     name = normalize_name(args.name)
     output = Path(args.output).expanduser().resolve()
@@ -706,13 +565,7 @@ def create_plugin(args: argparse.Namespace) -> Path:
         raise PluginError(f"destination path exceeds the Windows-safe limit: {target}")
     if os.path.lexists(target):
         raise PluginError(f"destination already exists: {target}")
-    adapters = [item.strip() for item in args.adapters.split(",") if item.strip()]
-    if len(adapters) != len(set(adapters)) or set(adapters) - {"codex", "claude"}:
-        raise PluginError("--adapters accepts a comma-separated subset of codex,claude")
-
     tmp = Path(tempfile.mkdtemp(prefix=f".{name}.create-", dir=output))
-    published: list[Path] = []
-    created_staging_root = False
     try:
         canonical = tmp / name
         (canonical / "skills").mkdir(parents=True)
@@ -742,51 +595,10 @@ def create_plugin(args: argparse.Namespace) -> Path:
                 }],
             })
         validate_plugin(canonical)
-        projection_tmp = tmp / "projections"
-        for adapter in adapters:
-            build_projection(canonical, adapter, projection_tmp)
-        for adapter in adapters:
-            destination = output / ".staging" / adapter
-            if os.path.lexists(destination):
-                raise PluginError(f"projection destination already exists: {destination}")
-        staging_root = output / ".staging"
-        if adapters:
-            if os.path.lexists(staging_root):
-                _require_real_contained_directory(
-                    staging_root, output, label="projection staging directory"
-                )
-            else:
-                staging_root.mkdir()
-                created_staging_root = True
-                _require_real_contained_directory(
-                    staging_root, output, label="projection staging directory"
-                )
         try:
             os.replace(canonical, target)
-            published.append(target)
-            for adapter in adapters:
-                destination = staging_root / adapter
-                _require_real_contained_directory(
-                    staging_root, output, label="projection staging directory"
-                )
-                if os.path.lexists(destination):
-                    raise PluginError(f"projection destination already exists: {destination}")
-                os.replace(projection_tmp / adapter, destination)
-                published.append(destination)
         except Exception as exc:
-            rollback_errors: list[str] = []
-            for destination in reversed(published):
-                try:
-                    shutil.rmtree(destination)
-                except OSError as rollback_exc:
-                    rollback_errors.append(f"{destination}: {rollback_exc}")
-            if created_staging_root:
-                try:
-                    staging_root.rmdir()
-                except OSError:
-                    pass
-            detail = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
-            raise PluginError(f"failed to publish plugin transaction: {exc}{detail}") from exc
+            raise PluginError(f"failed to publish plugin: {exc}") from exc
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return target
@@ -798,7 +610,6 @@ def _parser() -> argparse.ArgumentParser:
     create = sub.add_parser("create-plugin", help="create a canonical plugin package")
     create.add_argument("name")
     create.add_argument("--output", required=True, help="parent directory for the canonical plugin")
-    create.add_argument("--adapters", default="", help="optional comma-separated codex,claude projections")
     create.add_argument("--version", default="0.1.0")
     create.add_argument("--description")
     create.add_argument("--author", default="Internal Platform Team")

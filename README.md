@@ -11,14 +11,12 @@ Python 3.11+ on Linux, macOS, and Windows.
 
 | Plugin | Purpose |
 | --- | --- |
-| `plugin-creator` | Create a canonical plugin and optional isolated Codex/Claude projections. |
+| `plugin-creator` | Create a canonical portable plugin package. |
 | `plugin-installer` | Install or update plugins from the latest approved release or a pinned Git commit. |
 | `engineering-starter` | Offline repository orientation; embeds `repo-summary` at build time. |
 
-Every canonical package has `plugins/<name>/plugin.json` and a `skills/`
-directory. Optional MCP configuration belongs only at `mcp.json`. Vendor files
-such as `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json` are generated
-outside the canonical package or during target installation.
+Every package has `plugins/<name>/plugin.json` and a `skills/` directory.
+Optional MCP configuration belongs only at `mcp.json`.
 
 ## Get and use this repository
 
@@ -30,7 +28,7 @@ git clone https://github.com/OkYongChoi/air-gapped-agent-plugins.git
 cd air-gapped-agent-plugins
 python3 -B scripts/validate_repo.py
 ./bin/plugin-installer list
-./bin/plugin-installer install engineering-starter --target portable
+./bin/plugin-installer install engineering-starter
 ```
 
 On Windows PowerShell:
@@ -39,14 +37,13 @@ On Windows PowerShell:
 git clone https://github.com/OkYongChoi/air-gapped-agent-plugins.git
 Set-Location air-gapped-agent-plugins
 python -B scripts/validate_repo.py
-bin\plugin-installer.ps1 install engineering-starter --target portable
+bin\plugin-installer.ps1 install engineering-starter
 ```
 
-Portable installations default to `~/.agents/plugins` on Linux/macOS and
-`%USERPROFILE%\.agents\plugins` on Windows. Select `--target codex` or
-`--target claude` for an isolated vendor projection. For a closed network,
-mirror the repository as shown below and centrally configure the internal
-GitLab source; end users then run only `install NAME` or `update NAME`.
+Installations default to `~/.agents/plugins` on Linux/macOS and
+`%USERPROFILE%\.agents\plugins` on Windows. For a closed network, mirror the
+repository as shown below and centrally configure the internal GitLab source;
+end users then run only `install NAME` or `update NAME`.
 
 ### Bring both repositories into an internal GitLab
 
@@ -73,8 +70,7 @@ Linux/macOS or `%ProgramData%\AgentTools\config.json` on Windows:
   },
   "plugins": {
     "source": "https://gitlab.company.local/ai/air-gapped-agent-plugins.git",
-    "allowMutableRef": false,
-    "defaultTarget": "portable"
+    "allowMutableRef": false
   },
   "agentHome": "~/.agents"
 }
@@ -120,7 +116,7 @@ git clone https://git.example.internal/agents/air-gapped-agent-plugins.git
 cd air-gapped-agent-plugins
 python3 -B scripts/validate_repo.py
 python3 -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py \
-  install plugin-installer --source "$PWD" --target portable --agent-home ~/.agents
+  install plugin-installer --source "$PWD" --agent-home ~/.agents
 ```
 
 No network is used when `--source` is a local checkout. For a temporary
@@ -138,7 +134,7 @@ git clone https://git.example.internal/agents/air-gapped-agent-plugins.git
 Set-Location air-gapped-agent-plugins
 python -B scripts/validate_repo.py
 python -B plugins/plugin-installer/skills/plugin-installer/scripts/plugin_installer.py `
-  install plugin-installer --source $PWD --target portable `
+  install plugin-installer --source $PWD `
   --agent-home (Join-Path $HOME ".agents")
 $env:AGENT_PLUGINS_SOURCE = "D:\approved-mirrors\plugins"
 $env:AGENT_PLUGINS_REF = "e0fbb53a8d04a26fd6f14051ed4ca855edb31070"
@@ -196,7 +192,7 @@ internal authentication mechanism.
 
 The installer resolves each field independently, with this precedence:
 
-1. CLI (`--source`, `--ref`, `--target`, `--agent-home`, `--scope`)
+1. CLI (`--source`, `--ref`, `--agent-home`, `--scope`)
 2. `AGENT_PLUGINS_SOURCE` and `AGENT_PLUGINS_REF`
 3. user config: `~/.agents/config.json` on Linux/macOS or
    `%USERPROFILE%\.agents\config.json` on Windows
@@ -216,8 +212,7 @@ Only JSON is accepted. A shared Skills/Plugins configuration looks like:
   },
   "plugins": {
     "source": "https://gitlab.company.local/ai/air-gapped-agent-plugins.git",
-    "allowMutableRef": false,
-    "defaultTarget": "portable"
+    "allowMutableRef": false
   },
   "agentHome": "~/.agents"
 }
@@ -254,7 +249,7 @@ required end-user setup step.
 ## Create plugins
 
 ```bash
-./bin/create-plugin my-plugin --output ./work --adapters codex,claude
+./bin/create-plugin my-plugin --output ./work
 ```
 
 Windows can call `bin\create-plugin.cmd` from cmd.exe,
@@ -262,9 +257,7 @@ Windows can call `bin\create-plugin.cmd` from cmd.exe,
 form `python -B bin\create-plugin ...`. Equivalent wrappers are provided for
 `plugin-installer`.
 
-This creates `work/my-plugin` as the canonical package and writes projections
-under `work/.staging/codex` and `work/.staging/claude`. The canonical package is
-not mutated by projection generation.
+This creates `work/my-plugin` as a portable package.
 
 Import a skill from a pinned internal Git source:
 
@@ -288,37 +281,15 @@ Import a skill from a pinned internal Git source:
 `list` and `install` use the approved catalog. `update` compares an external
 installation-state sidecar with the approved source, ref, release version, and
 package digest. An unchanged installation is reported as current. A changed
-portable, Codex, or Claude installation is projected and validated in staging
-before the plugin directory, marketplace entry, and state are replaced as one
-rollback-protected transaction. A legacy installation without a sidecar can be
-updated once and then participates in normal comparisons.
+installation is validated in staging before the plugin directory and state are
+replaced as one rollback-protected transaction. A legacy installation without a
+sidecar can be updated once and then participates in normal comparisons.
 
-Targets are `portable`, `codex`, or `claude`; central config can select one and
-the default is `portable`. Scope defaults to `user`. Portable user installs
-use `~/.agents/plugins/<name>`. Codex uses its native split layout:
-`~/.agents/plugins/marketplace.json` plus `~/plugins/<name>`, so the marketplace
-source `./plugins/<name>` resolves correctly. Claude uses a self-contained
-marketplace root at `~/.claude/plugins/marketplaces/okyongchoi-portable`, with
-`.claude-plugin/marketplace.json` and `plugins/<name>` as siblings. Project
-scope uses the equivalent roots below `./.agents` or `./.claude`.
-
-`--agent-home` relocates the native root. `--dest` overrides the portable plugin
-parent. For Claude, it must be a directory named exactly `plugins` directly
-below the intended marketplace root; arbitrary paths are rejected so
-`./plugins/<name>` cannot point elsewhere. For Codex it is accepted only when it
-equals the plugin directory implied by the selected agent home. Vendor targets
-contain native manifests and a projected `.mcp.json` when portable `mcp.json`
-is present. Register a non-default marketplace with the vendor CLI when that
-client requires it.
-
+Scope defaults to `user`. User installs use `~/.agents/plugins/<name>`.
+`--agent-home` relocates that root and `--dest` overrides the plugin parent.
 Project scope ignores a user/system-configured `agentHome` and uses the current
-project's `.agents` or `.claude` root. Supplying both CLI `--scope project` and
-CLI `--agent-home` is an explicit override and uses that CLI home.
-
-Portable manifests may contain only the required `$schema` and `name`. Native
-projections leave that canonical file unchanged and supply deterministic native
-defaults when metadata is absent: version `0.1.0`, description
-`Portable projection for <name>.`, and author `Unknown`.
+project's `.agents` root. Supplying both CLI `--scope project` and CLI
+`--agent-home` is an explicit override and uses that CLI home.
 
 An explicit ref overrides `latest-approved` and must be a full commit SHA. This
 is useful for audit reproduction or development diagnostics:
@@ -326,8 +297,7 @@ is useful for audit reproduction or development diagnostics:
 ```bash
 ./bin/plugin-installer install engineering-starter \
   --source https://git.example.internal/agents/air-gapped-agent-plugins.git \
-  --ref 0123456789abcdef0123456789abcdef01234567 \
-  --target codex
+  --ref 0123456789abcdef0123456789abcdef01234567
 ```
 
 `--allow-mutable-ref` is an explicit development escape hatch for a branch or
