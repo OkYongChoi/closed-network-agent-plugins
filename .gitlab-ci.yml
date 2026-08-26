@@ -23,6 +23,17 @@ validate:windows:
     - python -B -m unittest discover -s tests -v
     - python -B tests/platform_verify.py --autocrlf true
 
+validate:macos:
+  stage: validate
+  tags:
+    - macos
+  when: manual
+  allow_failure: true
+  script:
+    - python3 -B scripts/validate_repo.py
+    - python3 -B -m unittest discover -s tests -v
+    - python3 -B tests/platform_verify.py --autocrlf true
+
 publish:latest-approved:
   stage: publish
   tags:

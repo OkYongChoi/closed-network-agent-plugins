@@ -5,7 +5,7 @@ This repository is the public source for
 portable [Agent Plugins 1.0](https://github.com/agentplugins/agent-plugins-spec/blob/ff8ab5e392cc87bd88d87c060815a87490e51003/spec/1.0.0.md)
 without runtime package-manager or GitHub API dependencies. Python scripts use
 only the standard library and Git CLI. The supported runtime baseline is
-Python 3.11+ on Linux and Windows.
+Python 3.11+ on Linux, macOS, and Windows.
 
 ## Included plugins
 
@@ -63,7 +63,7 @@ git --git-dir closed-network-agent-plugins.git push --mirror \
 ```
 
 Deploy this source-only configuration to `/etc/agent-tools/config.json` on
-Linux or `%ProgramData%\AgentTools\config.json` on Windows:
+Linux/macOS or `%ProgramData%\AgentTools\config.json` on Windows:
 
 ```json
 {
@@ -200,7 +200,7 @@ The installer resolves each field independently, with this precedence:
 2. `AGENT_PLUGINS_SOURCE` and `AGENT_PLUGINS_REF`
 3. user config: `~/.agents/config.json` on Linux/macOS or
    `%USERPROFILE%\.agents\config.json` on Windows
-4. system config: `/etc/agent-tools/config.json` on Linux or
+4. system config: `/etc/agent-tools/config.json` on Linux/macOS or
    `%ProgramData%\AgentTools\config.json` on Windows
 5. the checkout containing the running installer
 6. the embedded canonical source and pinned emergency fallback SHA
@@ -457,9 +457,10 @@ temporary commit from the current tracked and untracked non-ignored working
 snapshot, performs an offline clean clone with the requested `core.autocrlf`
 setting, and reruns strict validation and tests from that clone.
 
-GitHub Actions runs the same checks on `ubuntu-latest` and `windows-latest`.
-For an internal GitLab, `.gitlab-ci.yml` contains separate jobs tagged `linux`
-and `windows`; configure self-managed shell runners with those tags, or rename
+GitHub Actions runs the same checks on `ubuntu-latest`, `macos-latest`, and
+`windows-latest`. For an internal GitLab, `.gitlab-ci.yml` contains required
+jobs tagged `linux` and `windows`, plus an optional manual `validate:macos` job
+tagged `macos`; configure self-managed shell runners with those tags, or rename
 the tags to match the internal runner inventory. The Windows shell executor is
 expected to provide `python` and `git` on `PATH` (PowerShell/pwsh is supported).
 No CI job pulls a language package or container image.

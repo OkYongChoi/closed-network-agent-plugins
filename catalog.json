@@ -10,12 +10,12 @@
     {
       "name": "plugin-creator",
       "path": "plugins/plugin-creator",
-      "content_sha256": "4fa4c4f33004965ba56bb50ad51433594ae5d4f296dd5ce5917805d6e1468b83"
+      "content_sha256": "4120dddcf656ee51f0fac4ac3d97802853197f1fe01efddd12aa869f6da433eb"
     },
     {
       "name": "plugin-installer",
       "path": "plugins/plugin-installer",
-      "content_sha256": "d3cbbef6fcab085f1ab68b2474fde5c04fc3047b78e13bd1f01820c5daf05e37"
+      "content_sha256": "7f2b4f579deb58645332a2ad2f7b4d37a5267f76731c36b6f3865cf41a2651cc"
     }
   ]
 }
